@@ -1,0 +1,16 @@
+{
+  "name": "daisychain-infer",
+  "version": "1.0.0",
+  "description": "Run one Hugging Face model across several devices — layer-sharded pipeline inference in the browser, peer-to-peer over WebRTC, computed through verified INT8 units. Runs locally.",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test_pipeline.js && node test_wire.js && node test_loader.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "MIT",
+  "author": "Dean Byrne (Quazim0t0)"
+}

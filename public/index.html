@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DaisyChain-Infer — run one model across your devices</title>
+<style>
+  /* Winter palette: pale snow-light, deep glacier dark. Blues and slates
+     throughout, with a cold cyan accent that stays legible on both. */
+  :root {
+    --page-bg: #eef3f8;
+    --page-tint: #dce6f0;
+    --card-bg: #f9fbfd;
+    --card-border: rgba(90, 122, 154, 0.28);
+    --text: #16232e;
+    --text-soft: #55708a;
+    --accent: #2f6f96;
+    --accent-deep: #1d4b6b;
+    --panel-bg: linear-gradient(135deg, #24455e 0%, #14283a 100%);
+    --panel-num: #eaf4fb;
+    --panel-label: #8fb4cd;
+    --btn: linear-gradient(135deg, #35789e 0%, #1d4b6b 100%);
+    --btn-hover: linear-gradient(135deg, #4189af 0%, #255a7f 100%);
+    --danger: #9a3d3d;
+    --warn: #a2472f;
+    --track: rgba(90, 122, 154, 0.20);
+    --shadow: 0 2px 12px rgba(30, 60, 90, 0.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page-bg: #0c141d;
+      --page-tint: #101c27;
+      --card-bg: #14212d;
+      --card-border: rgba(140, 180, 210, 0.22);
+      --text: #dce9f3;
+      --text-soft: #8faec7;
+      --accent: #6fb5da;
+      --accent-deep: #9fd0e8;
+      --panel-bg: linear-gradient(135deg, #16303f 0%, #0a1620 100%);
+      --panel-num: #e6f3fb;
+      --panel-label: #7ea9c4;
+      --btn: linear-gradient(135deg, #2c6688 0%, #17394f 100%);
+      --btn-hover: linear-gradient(135deg, #37789d 0%, #1e4a66 100%);
+      --danger: #b3554f;
+      --warn: #e0a07f;
+      --track: rgba(140, 180, 210, 0.18);
+      --shadow: 0 2px 14px rgba(0, 0, 0, 0.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         max-width: 760px; margin: 0 auto; padding: 24px 18px 48px; line-height: 1.5;
+         background: linear-gradient(180deg, var(--page-tint) 0%, var(--page-bg) 340px);
+         color: var(--text); }
+  h1 { margin: 0 0 2px; font-size: 1.7rem; letter-spacing: .2px; }
+  .sub { color: var(--text-soft); margin: 0 0 18px; font-size: .92rem; }
+  .sub code, code { background: rgba(47, 111, 150, .12); padding: 1px 5px; border-radius: 4px;
+                    font-family: 'Cascadia Code', 'Courier New', monospace; font-size: .9em; }
+  .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px;
+          padding: 14px 16px; margin: 12px 0; box-shadow: var(--shadow); }
+  .lbl { color: var(--text-soft); font-size: 11px; font-weight: 800; letter-spacing: 1.5px;
+         text-transform: uppercase; margin-bottom: 8px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; font-size: .95rem; }
+  .k { color: var(--text-soft); } .v { font-weight: 700; text-align: right; word-break: break-word; }
+  .device { font-family: 'Cascadia Code', 'Courier New', monospace; font-size: 1.5rem; font-weight: 700;
+            color: var(--accent-deep); }
+  .panel { background: var(--panel-bg); border-radius: 10px; padding: 12px 16px; text-align: center; flex: 1; }
+  .panel .num { font-family: 'Cascadia Code', 'Courier New', monospace; font-size: 1.7rem;
+                font-weight: 700; color: var(--panel-num); }
+  .panel .cl { color: var(--panel-label); font-size: 10px; text-transform: uppercase; letter-spacing: 1.2px; }
+  button { background: var(--btn); color: #eef6fb; border: 0; border-radius: 8px; padding: 11px 24px;
+           font-weight: 700; font-size: .98rem; letter-spacing: .3px; cursor: pointer;
+           box-shadow: 0 2px 8px rgba(20, 45, 70, 0.22); transition: .15s; }
+  button:hover:not(:disabled) { background: var(--btn-hover); }
+  button:disabled { background: #7d8f9e; opacity: .5; cursor: not-allowed; box-shadow: none; }
+  button.small { padding: 6px 14px; font-size: .85rem; }
+  button.danger { background: var(--danger); }
+  pre { background: rgba(20, 45, 70, 0.05); border-radius: 8px; padding: 10px; max-height: 180px; overflow: auto;
+        font-size: .78rem; color: var(--text-soft); white-space: pre-wrap; margin: 0;
+        font-family: 'Cascadia Code', 'Courier New', monospace; }
+  @media (prefers-color-scheme: dark) { pre { background: rgba(0, 0, 0, 0.28); } }
+  .note { color: var(--text-soft); font-size: .82rem; }
+  .note b { color: var(--warn); }
+  .slbl { display: flex; justify-content: space-between; font-size: .92rem; margin: 10px 0 4px; font-weight: 600; }
+  .sval { font-family: 'Cascadia Code', 'Courier New', monospace; color: var(--accent); font-weight: 700; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  input[type=text], input[type=number], input[type=password] {
+        padding: 10px 12px; border-radius: 8px; border: 1px solid var(--card-border);
+        background: rgba(255,255,255,.55); color: inherit;
+        font-family: 'Cascadia Code', 'Courier New', monospace; font-size: .92rem; }
+  @media (prefers-color-scheme: dark) {
+    input[type=text], input[type=number], input[type=password] { background: rgba(0,0,0,.25); }
+  }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #out { background: rgba(20, 45, 70, 0.05); border-radius: 8px; padding: 12px; min-height: 96px;
+         max-height: 340px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+         font-family: 'Cascadia Code', 'Courier New', monospace; font-size: .9rem; color: var(--text); }
+  @media (prefers-color-scheme: dark) { #out { background: rgba(0, 0, 0, 0.28); } }
+  .joinrow { display: flex; gap: 8px; align-items: center; justify-content: space-between;
+             margin-top: 10px; flex-wrap: wrap; }
+  .modal { position: fixed; inset: 0; background: rgba(8, 18, 28, .62); backdrop-filter: blur(3px);
+           display: none; align-items: center; justify-content: center; padding: 20px; z-index: 50; }
+  .modal .box { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px;
+                padding: 20px; max-width: 460px; width: 100%; box-shadow: 0 10px 40px rgba(0,0,0,.35); }
+  .modal h3 { margin: 0 0 8px; font-size: 1.1rem; }
+  .modal input { width: 100%; margin: 12px 0 6px; }
+  .modal .acts { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+</style>
+</head>
+<body>
+  <h1>❄ DaisyChain-Infer</h1>
+  <p class="sub">Run <b>one model across several devices</b>. Each device downloads and holds only its <b>own layers</b> — straight from Hugging Face, never from a peer — and passes the hidden state around the ring over WebRTC. The group can run a model that no single device could hold. Every multiply goes through the verified INT8 units. Runs locally: <code>npm start</code>.</p>
+
+  <!-- Shown only when the deployment sets DAISY_FORCE_ROOMS (the hosted Space).
+       Without it, visitors with no room code are grouped by public IP — which
+       on a public URL would put strangers behind the same CGNAT in one ring. -->
+  <div class="card" id="lobby" style="display:none;text-align:center">
+    <div class="lbl">❄ Get started</div>
+    <p class="note" style="margin:0 0 12px">Create a room and invite your own devices, or join a room someone shared with you. Rings are private by invitation — you approve every device that joins.</p>
+    <button id="createRoom">Create a room</button>
+    <div style="display:flex;gap:8px;justify-content:center;margin-top:12px;flex-wrap:wrap">
+      <input type="text" id="joinCode" placeholder="room code" spellcheck="false">
+      <button id="joinRoom" style="padding:10px 18px">Join</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="lbl">❄ This device</div>
+    <div class="device" id="me">—</div>
+    <div class="row" style="margin-top:8px"><span class="k">Status</span><span class="v" id="status">starting…</span></div>
+    <div class="row"><span class="k">Compute</span><span class="v" id="backend">detecting…</span></div>
+    <div class="row"><span class="k">My slice</span><span class="v" id="myShard">none yet</span></div>
+    <div class="row"><span class="k">HF token</span><span class="v" id="tokenState">none</span></div>
+    <div style="text-align:right"><button id="clearToken" class="small danger" style="display:none">Forget token</button></div>
+  </div>
+
+  <div class="card">
+    <div class="lbl">🜂 Devices in your group</div>
+    <div class="row"><span class="v" id="peers" style="text-align:left">(none yet)</span></div>
+    <div id="roomInfo" style="display:none;margin-top:8px">
+      <div class="row"><span class="k">Room</span><span class="v" id="roomCode"></span></div>
+      <div style="text-align:center;margin-top:6px"><button id="copyLink" class="small">Copy invite link</button></div>
+      <p class="note" style="margin:.5rem 0 0;text-align:center">Open the link on your other devices — you approve each one before it joins.</p>
+    </div>
+    <div id="requests"></div>
+  </div>
+
+  <div class="card">
+    <div class="lbl">🗻 Model</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <input type="text" id="repo" value="HuggingFaceTB/SmolLM-135M" spellcheck="false"
+             placeholder="owner/name" style="flex:2;min-width:200px">
+      <input type="text" id="revision" value="main" spellcheck="false" placeholder="revision" style="flex:0 0 90px">
+      <button id="loadRepo">Load</button>
+    </div>
+    <div class="row" style="margin-top:10px"><span class="v" id="model" style="text-align:left">no model loaded</span></div>
+    <div class="row"><span class="k">Status</span><span class="v" id="modelState">—</span></div>
+    <div class="row"><span class="k">Tokenizer</span><span class="v" id="tokenizer">—</span></div>
+    <p class="note" style="margin:.6rem 0 0">Any Hugging Face repo with <code>.safetensors</code> weights whose architecture is <b>Llama-style</b> (Llama, Mistral, Qwen2, SmolLM, TinyLlama) or <b>GPT-2-style</b>. Loading reads only <code>config.json</code>, the tokenizer, and the weight <i>headers</i> — a few tens of KB, whatever the model's size. Gated or private repos will ask for a token, once.</p>
+  </div>
+
+  <div class="card">
+    <div class="lbl">⛓ Ring plan</div>
+    <pre id="plan" style="max-height:140px">load a model to see how it would be split</pre>
+    <p class="note" style="margin:.5rem 0 0">Layers are apportioned by <b>measured</b> speed — each device times a real GEMM through its own kernel. The MB figure is what that device will actually download and hold.</p>
+  </div>
+
+  <div class="card">
+    <div class="lbl">🎚 Generation</div>
+    <label class="slbl">Tokens <span class="sval" id="vntok">60</span></label>
+    <input type="range" id="ntok" min="10" max="400" step="10" value="60">
+    <label class="slbl">Context length <span class="sval" id="vctxLen">64</span></label>
+    <input type="range" id="ctxLen" min="16" max="512" step="16" value="64">
+    <p class="note" style="margin:.3rem 0 .6rem">There is no KV cache — every token re-runs the whole window, so context length is the main cost per token.</p>
+    <label class="slbl">Temperature ÷100 <span class="sval" id="vtemp">0</span></label>
+    <input type="range" id="temp" min="0" max="150" step="5" value="0">
+    <p class="note" style="margin:.3rem 0 .6rem">0 = greedy, which is deterministic and therefore checkable. Above 0, sampling follows the seed so runs stay reproducible.</p>
+    <label class="slbl">Seed</label>
+    <input type="number" id="seed" value="1234" style="width:140px">
+    <div class="row" id="verifyRow" style="display:none;margin-top:10px">
+      <label class="note" style="display:flex;gap:8px;align-items:center;cursor:pointer">
+        <input type="checkbox" id="verify"> Verify afterwards against a single-device run
+        <span>(downloads the whole model here — only sensible for small ones)</span>
+      </label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="lbl">✎ Prompt</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <input type="text" id="prompt" value="The quick brown fox" spellcheck="false" style="flex:1;min-width:180px">
+      <button id="genBtn" disabled>Generate</button>
+      <button id="stopBtn" disabled class="danger">Stop</button>
+    </div>
+    <div id="out" style="margin-top:10px"></div>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <div class="panel"><div class="num" id="tps">—</div><div class="cl">tokens / sec</div></div>
+      <div class="panel"><div class="num" id="tokcount">0</div><div class="cl">tokens</div></div>
+      <div class="panel"><div class="num" id="hops">0</div><div class="cl">ring hops</div></div>
+    </div>
+    <div class="row" style="margin-top:8px"><span class="k">Ring</span><span class="v" id="ringState">idle</span></div>
+  </div>
+
+  <div class="card">
+    <div class="lbl">❋ Log</div>
+    <pre id="log"></pre>
+  </div>
+
+  <p class="note">Needs a secure context (localhost or HTTPS) for WebGPU and cross-device WebRTC. No WebGPU? The identical verified INT8 units run on CPU — slower, but a CPU device and a GPU device produce the same bits, so they can share a ring. There is no plain-float path.</p>
+  <p class="note"><b>Heads up:</b> peers connect directly, so devices in your ring can see each other's IP address. A middle stage never receives the embedding table or the vocabulary, but it does see the hidden states passing through — and the head sees your prompt and output. Run rings with devices and people you trust. Proof of concept, not a hardened service.</p>
+
+  <!-- One-time credential prompt, shown only when a request actually fails for
+       want of one. Never stored: not localStorage, not sessionStorage, not a
+       cookie, and never sent to a peer — each device authenticates itself.
+       Reloading the tab forgets it.
+
+       On a hosted deployment the paste box is hidden entirely and only
+       "Sign in with Hugging Face" is offered: typing a personal access token
+       into a page you do not control is a bad habit even when the code is
+       honest, because you cannot verify that it is. -->
+  <div class="modal" id="tokModal">
+    <div class="box">
+      <h3>❄ Hugging Face access</h3>
+      <p class="note" id="tokWhy">This model needs a token to download.</p>
+      <div id="tokSignIn" style="display:none;margin:14px 0 6px">
+        <button id="tokSignInBtn" style="width:100%">Sign in with Hugging Face</button>
+        <p class="note" style="margin:.6rem 0 0">You are redirected to huggingface.co and back. This page receives a <b>scoped, expiring</b> token — read access to repositories, nothing else — held in memory for this tab only. No token is ever typed into this page, and none is sent to other devices.</p>
+      </div>
+      <div id="tokPasteRow">
+        <input type="password" id="tokInput" placeholder="hf_…" spellcheck="false" autocomplete="off">
+        <p class="note" style="margin:0">Kept <b>in memory for this tab only</b>: never written to disk or storage, never put in a URL, never logged, and never sent to other devices — each device is asked for its own. Create a <b>read</b> token at huggingface.co/settings/tokens.</p>
+      </div>
+      <div class="acts">
+        <button id="tokCancel" class="small danger">Cancel</button>
+        <button id="tokOk" class="small">Use token</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="traincore.js"></script>
+  <script src="verified_core.js"></script>
+  <script src="safetensors.js"></script>
+  <script src="hf.js"></script>
+  <script src="arch.js"></script>
+  <script src="tokenizer.js"></script>
+  <script src="shard.js"></script>
+  <script src="wire.js"></script>
+  <script src="infer.js"></script>
+  <script src="webgpu.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

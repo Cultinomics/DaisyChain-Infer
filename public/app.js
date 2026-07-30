@@ -144,10 +144,14 @@ const readyStages = new Set();
 
 function nmeOf(id) { return names.get(id) || id; }
 function room() { return new URLSearchParams(location.search).get("room"); }
+// ?relay=1 skips WebRTC entirely and routes through the server. It exists as a
+// diagnostic: if a ring works with it and not without it, the problem is NAT
+// traversal, not this code.
+const forceRelay = new URLSearchParams(location.search).get("relay") === "1";
 function updatePeers() {
   if (!names.size) { ui.peers.textContent = "(none yet — you can still run solo)"; return; }
-  ui.peers.textContent = [...names.entries()]
-    .map(([id, n]) => `${n} ${chans.has(id) ? "✓" : "(connecting…)"}`).join(", ");
+  ui.peers.textContent = [...names.entries()].map(([id, n]) =>
+    `${n} ${chans.has(id) ? (relayed.has(id) ? "⇄ via server" : "✓") : "(connecting…)"}`).join(", ");
 }
 function ctxLen() { return +ui.ctxLen.value; }
 
@@ -183,6 +187,14 @@ function connectSignaling() {
       addJoinRequest(msg.id, msg.name);
     } else if (msg.type === "peer-joined") {
       names.set(msg.id, msg.name); updatePeers(); log(`${msg.name} joined`);
+      // Only the NEWEST peer dials (so the two never collide with competing
+      // offers), which means this side is waiting to be called. It still needs
+      // a deadline: if the offer never arrives, or arrives and its ICE never
+      // completes, there is no connection object here to fail — and without a
+      // watchdog this side shows "(connecting…)" forever with nothing to
+      // recover from. That is the failure two separate machines actually hit.
+      if (forceRelay) useRelay(msg.id);
+      else if (!chans.has(msg.id)) armWatchdog(msg.id);
     } else if (msg.type === "peer-left") {
       log(`${nmeOf(msg.id)} left`); cleanupPeer(msg.id); names.delete(msg.id); caps.delete(msg.id); updatePeers(); renderPlan();
     } else if (msg.type === "signal") {
@@ -216,11 +228,94 @@ function addJoinRequest(id, name) {
   ui.requests.appendChild(row);
 }
 
+// ---- connection watchdog -----------------------------------------------------
+// WebRTC can fail by never finishing. A peer whose ICE never completes sits in
+// "checking" indefinitely: `dc.onclose` never fires because the channel never
+// opened, and `connectionState` may never reach "failed" either. Without a
+// timeout the UI shows "(connecting…)" forever, the relay fallback below is
+// never reached, and nothing says why — which is exactly what happened on two
+// real machines while two tabs on one machine worked fine, because same-host
+// candidates always succeed.
+//
+// So: give each attempt a deadline, say what state it died in, retry once, then
+// fall back to relaying through the server.
+const CONNECT_TIMEOUT = 12000;
+const MAX_DIRECT_ATTEMPTS = 2;
+const watchdogs = new Map();                   // peerId -> timer
+const attempts = new Map();                    // peerId -> count
+const relayed = new Set();                     // peers we reach via the server
+
+function clearWatchdog(peerId) {
+  const t = watchdogs.get(peerId);
+  if (t) { clearTimeout(t); watchdogs.delete(peerId); }
+}
+function armWatchdog(peerId) {
+  clearWatchdog(peerId);
+  watchdogs.set(peerId, setTimeout(() => {
+    watchdogs.delete(peerId);
+    if (chans.has(peerId) || !names.has(peerId)) return;
+    const pc = pcs.get(peerId);
+    const n = (attempts.get(peerId) || 0) + 1;
+    attempts.set(peerId, n);
+    log(`no direct path to ${nmeOf(peerId)} after ${CONNECT_TIMEOUT / 1000}s — ` +
+        `ICE ${pc ? pc.iceConnectionState : "?"}, gathering ${pc ? pc.iceGatheringState : "?"} ` +
+        `(attempt ${n} of ${MAX_DIRECT_ATTEMPTS})`);
+    if (n < MAX_DIRECT_ATTEMPTS) {
+      // one side redials so the two do not collide (offer glare); the other
+      // just waits out another deadline
+      if (+myId.slice(1) > +peerId.slice(1)) { cleanupPeer(peerId); initiatePeer(peerId); }
+      else armWatchdog(peerId);
+      return;
+    }
+    useRelay(peerId);                          // symmetric: both sides install it
+  }, CONNECT_TIMEOUT));
+}
+
+// Relay through the signaling server. Both peers already hold a WebSocket to
+// it, so this is a path that cannot fail for NAT reasons — but it means the
+// server carries activations, which the direct path specifically avoids. That
+// is a real change in what the server sees, so it is stated loudly rather than
+// slipped in as a silent recovery.
+function useRelay(peerId) {
+  if (chans.has(peerId) || !names.has(peerId)) return;
+  cleanupPeer(peerId);
+  chans.set(peerId, makeRelayChannel(peerId));
+  relayed.add(peerId);
+  log(`⚠ falling back to the SERVER RELAY for ${nmeOf(peerId)} — no direct WebRTC path could be ` +
+      `established. This works, but activations for that hop now pass through the server instead ` +
+      `of peer-to-peer. Supply a TURN server (DAISY_RTC_CONFIG) for a direct path.`);
+  // A relay channel is a plain object with no "open" event, so nothing here
+  // fires dc.onopen — and without this the capability exchange never happens,
+  // the peer never enters the plan, and the ring silently shrinks to whoever
+  // had a direct channel. Losing a stage quietly is worse than failing loudly.
+  sendHello(peerId);
+  updatePeers(); wake();
+}
+
 function newPC(peerId) {
   const pc = new RTCPeerConnection(rtcConfig);
   pc.onicecandidate = (e) => { if (e.candidate) signal(peerId, { candidate: e.candidate }); };
+  // Terse but real diagnostics: without these, a cross-machine failure is
+  // indistinguishable from a hang.
+  pc.oniceconnectionstatechange = () => {
+    const s = pc.iceConnectionState;
+    if (s === "failed" || s === "disconnected" || s === "connected" || s === "completed")
+      log(`${nmeOf(peerId)}: ICE ${s}`);
+  };
+  pc.onicegatheringstatechange = () => {
+    if (pc.iceGatheringState === "complete" && !chans.has(peerId))
+      log(`${nmeOf(peerId)}: finished gathering candidates, still no channel`);
+  };
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState === "failed") { cleanupPeer(peerId); scheduleReconnect(peerId); }
+    if (pc.connectionState === "failed") {
+      log(`${nmeOf(peerId)}: connection failed`);
+      clearWatchdog(peerId);
+      const n = (attempts.get(peerId) || 0) + 1;
+      attempts.set(peerId, n);
+      cleanupPeer(peerId);
+      if (n < MAX_DIRECT_ATTEMPTS) scheduleReconnect(peerId);
+      else useRelay(peerId);
+    }
     if (pc.connectionState === "disconnected")
       setTimeout(() => {
         if (pcs.get(peerId) === pc && pc.connectionState === "disconnected") {
@@ -231,6 +326,22 @@ function newPC(peerId) {
   };
   pcs.set(peerId, pc);
   return pc;
+}
+
+// Which path actually carried the connection — host, srflx (STUN) or relay
+// (TURN). Printed on success because "it connected" and "it connected the way
+// you think" are different facts.
+async function logSelectedPath(peerId, pc) {
+  try {
+    const stats = await pc.getStats();
+    let pair = null;
+    stats.forEach(r => {
+      if (r.type === "candidate-pair" && r.state === "succeeded" && (r.selected || r.nominated)) pair = r;
+    });
+    if (!pair) return;
+    const loc = stats.get(pair.localCandidateId), rem = stats.get(pair.remoteCandidateId);
+    log(`${nmeOf(peerId)}: direct path via ${loc ? loc.candidateType : "?"} → ${rem ? rem.candidateType : "?"}`);
+  } catch (e) {}
 }
 function b64FromBuf(buf) {
   const u = new Uint8Array(buf); let s = "";
@@ -250,14 +361,7 @@ function makeRelayChannel(peerId) {
 const reconnectTimers = new Map();
 function scheduleReconnect(peerId, attempt = 0) {
   if (!names.has(peerId) || chans.has(peerId) || reconnectTimers.has(peerId)) return;
-  if (attempt >= 5) {
-    if (names.has(peerId)) {
-      log(`no direct WebRTC path to ${nmeOf(peerId)} after 5 attempts — relaying activations through the server instead`);
-      chans.set(peerId, makeRelayChannel(peerId));
-      updatePeers(); wake();
-    }
-    return;
-  }
+  if (attempt >= MAX_DIRECT_ATTEMPTS) return void useRelay(peerId);
   const delay = 1500 * Math.pow(2, attempt);
   reconnectTimers.set(peerId, setTimeout(() => {
     reconnectTimers.delete(peerId);
@@ -265,20 +369,28 @@ function scheduleReconnect(peerId, attempt = 0) {
     if (+myId.slice(1) > +peerId.slice(1)) {
       log(`reconnecting to ${nmeOf(peerId)} (attempt ${attempt + 1})…`);
       cleanupPeer(peerId); initiatePeer(peerId);
+    } else {
+      armWatchdog(peerId);                       // the other side dials; still deadline it
     }
-    setTimeout(() => scheduleReconnect(peerId, attempt + 1), 6000);
+    setTimeout(() => scheduleReconnect(peerId, attempt + 1), CONNECT_TIMEOUT + 2000);
   }, delay));
 }
 function initiatePeer(peerId) {
+  if (forceRelay) return useRelay(peerId);       // ?relay=1 — skip WebRTC entirely
   const pc = newPC(peerId);
   setupChannel(peerId, pc.createDataChannel("daisy"));
+  armWatchdog(peerId);                           // no silent forever-connecting
   pc.createOffer().then(o => pc.setLocalDescription(o)).then(() => signal(peerId, { sdp: pc.localDescription }));
 }
 const pendingCand = new Map();
 async function onSignal(from, data) {
   let pc = pcs.get(from);
   if (data.sdp) {
-    if (!pc) { pc = newPC(from); pc.ondatachannel = (e) => setupChannel(from, e.channel); }
+    if (!pc) {
+      pc = newPC(from);
+      pc.ondatachannel = (e) => setupChannel(from, e.channel);
+      armWatchdog(from);                         // the answering side needs a deadline too
+    }
     await pc.setRemoteDescription(data.sdp);
     for (const c of pendingCand.get(from) || []) try { await pc.addIceCandidate(c); } catch (e) {}
     pendingCand.delete(from);
@@ -293,13 +405,25 @@ async function onSignal(from, data) {
 }
 function setupChannel(peerId, dc) {
   dc.binaryType = "arraybuffer";
-  dc.onopen = () => { chans.set(peerId, dc); updatePeers(); log(`connected to ${nmeOf(peerId)}`); sendHello(peerId); };
+  dc.onopen = () => {
+    clearWatchdog(peerId);
+    attempts.delete(peerId);
+    relayed.delete(peerId);
+    chans.set(peerId, dc); updatePeers();
+    log(`connected to ${nmeOf(peerId)}`);
+    const pc = pcs.get(peerId);
+    if (pc) logSelectedPath(peerId, pc);
+    sendHello(peerId);
+  };
   dc.onclose = () => { chans.delete(peerId); updatePeers(); wake(); scheduleReconnect(peerId); };
   dc.onmessage = (e) => onWire(peerId, e.data);
 }
 function cleanupPeer(id) {
+  clearWatchdog(id);
   const pc = pcs.get(id); if (pc) pc.close();
-  pcs.delete(id); chans.delete(id); pendingCand.delete(id);
+  pcs.delete(id); pendingCand.delete(id);
+  const dc = chans.get(id);
+  if (dc && !dc.isRelay) chans.delete(id);       // keep a working relay channel
   for (const k of fragIn.keys()) if (k.startsWith(id + ":")) fragIn.delete(k);
   wake();
 }

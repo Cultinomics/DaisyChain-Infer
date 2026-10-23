@@ -426,7 +426,7 @@ function cleanupPeer(id) {
   const dc = chans.get(id);
   if (dc && !dc.isRelay) chans.delete(id);       // keep a working relay channel
   for (const k of fragIn.keys()) if (k.startsWith(id + ":")) fragIn.delete(k);
-  if (running) peerDropped = true;
+  if (running && plan && plan.some(s => s.id === id && s.id !== myId)) peerDropped = true;
   caps.delete(id);
   wake();
 }
@@ -559,8 +559,30 @@ async function loadRepo() {
 }
 
 const prefixIndex = Shard.makePrefixIndex(64);
+function restorePrefixes() {
+  if (typeof indexedDB === "undefined") return;
+  const open = indexedDB.open("daisychain-infer", 1);
+  open.onupgradeneeded = () => {
+    if (!open.result.objectStoreNames.contains("prefix")) open.result.createObjectStore("prefix");
+  };
+  open.onsuccess = () => {
+    const db = open.result;
+    if (!db.objectStoreNames.contains("prefix")) return;
+    const cur = db.transaction("prefix").objectStore("prefix").openCursor();
+    cur.onsuccess = () => {
+      const row = cur.result;
+      if (!row) return;
+      const bytes = row.value;
+      if (bytes && bytes.byteLength >= 4) {
+        const u32 = new Uint32Array(bytes.buffer, bytes.byteOffset, (bytes.byteLength / 4) | 0);
+        prefixIndex.restore(String(row.key), Array.from(u32));
+        kvSpill.put(String(row.key), bytes);
+      }
+      row.continue();
+    };
+  };
+}
 const kvSpill = Shard.makeKvSpill(32 * 1048576);
-const CHAT = "chat";
 const LAP_BUDGET_MS = 120000;
 
 function memberList() {
@@ -612,6 +634,7 @@ async function loadMyStage(assign, st) {
                              `${assign.repo} weights`);
   const w = Shard.stageWeights(s, st, got, Arch);
   stageObj = Infer.makeStage(s, st, w, kernelCtx(), assign.ctx || ctxLen());
+  stageObj.pass = assign.pass === "chunk" ? "chunk" : "window";
   spec = s;
   ui.myShard.textContent = `${st.head ? "head + " : ""}layers ${st.lo}–${st.hi - 1} · ${mb.toFixed(0)} MB resident`;
   return stageObj;
@@ -692,9 +715,7 @@ async function onAct(peerId, buf) {
   const kind = Wire.classifyAct(nextIndex, me ? me.index : -99);
   if (kind === "return") { actIn.set(`${seq}:${tokenIdx}`, hidden); wake(); return; }
   if (kind === "other" || !me || !stageObj) return;
-  const rows = hidden.length / spec.hidden;
-  const chunked = Number.isInteger(rows) && rows !== stageObj.T;
-  if (chunked) {
+  if (stageObj.pass === "chunk") {
     if (!stageObj.inbox || stageObj.boxSeq !== seq) {
       stageObj.inbox = new Map();
       stageObj.boxSeq = seq;
@@ -763,25 +784,27 @@ async function generate(isReplay) {
     const promptText = ui.prompt.value || "The";
     let idsPreview = [...Tokenizer.encode(tok, promptText)];
     if (!idsPreview.length) idsPreview = [0];
-    const lapMs = Shard.estimateLapMs(spec, T, myCapacity);
-    log(`lap estimate ${Math.round(lapMs)} ms/token on this device's capacity (budget ${LAP_BUDGET_MS} ms).`);
-    if (lapMs > LAP_BUDGET_MS) {
-      throw new Error(`refusing the run: estimated ${Math.round(lapMs)} ms per token exceeds ${LAP_BUDGET_MS} ms. ` +
-                      `Add a faster device or lower the context length.`);
-    }
     const fits = Shard.headCanHold(spec, repoInfo.tensors, navigator.deviceMemory || 0);
     const local = Shard.preferLocal(idsPreview.length, plan.length - 1, fits);
-    const matched = prefixIndex.matchedBlocks(CHAT, idsPreview);
+    const chatKey = String((prefixIndex.blocks(idsPreview)[0]) || "empty");
+    const matched = prefixIndex.matchedBlocks(chatKey, idsPreview);
     if (matched) {
       log(`prefix index: ${matched} block(s) of 64 tokens match this chat. ` +
           `The window is still recomputed so the token ids stay bit-identical to a full pass.`);
     }
     if (local) {
-      log(`short prompt (${idsPreview.length} tokens) fits on this device ` +
-          `(${(navigator.deviceMemory)} GB reported). Running here. The ring is not used for this turn.`);
+      log(`this device can hold the model (${navigator.deviceMemory} GB reported). ` +
+          `Running here. The ring is not used for this turn.`);
       plan = [{ id: myId, index: 0, lo: 0, hi: spec.layers, head: true, capacity: myCapacity, backend: compute.backend }];
       renderPlan();
     }
+    const lapMs = Shard.estimatePlanMs(spec, T, plan);
+    log(`lap estimate ${Math.round(lapMs)} ms/token across ${plan.length} stage(s) (budget ${LAP_BUDGET_MS} ms).`);
+    if (lapMs > LAP_BUDGET_MS) {
+      throw new Error(`refusing the run: estimated ${Math.round(lapMs)} ms per token exceeds ${LAP_BUDGET_MS} ms. ` +
+                      `Add a faster device or lower the context length.`);
+    }
+    const willChunk = plan.length > 1 && idsPreview.length > 32;
     if (plan.length > 1) {
       log(`plan: ${spec.layers} layers over ${plan.length} device(s) — ` +
           plan.map(s => `${s.id === myId ? "me" : nmeOf(s.id)}:${s.hi - s.lo}`).join(", "));
@@ -789,6 +812,7 @@ async function generate(isReplay) {
         await sendTo(plan[i].id, Wire.packAssign({
           repo: repoInfo.repo, revision: repoInfo.revision, spec, plan,
           mine: i, fingerprint: repoInfo.fingerprint, ctx: T,
+          pass: willChunk ? "chunk" : "window",
         }));
       log("waiting for every stage to fetch its layers…");
       const ok = await waitFor(() => readyStages.size >= plan.length - 1, 600000);
@@ -804,17 +828,17 @@ async function generate(isReplay) {
     const nTok = +ui.ntok.value, temp = +ui.temp.value / 100;
     const opts = { temperature: temp, topK: 40, rng: Infer.mulberry32(+ui.seed.value | 0) };
     let ids = idsPreview.slice();
-    prefixIndex.note(CHAT, ids);
+    prefixIndex.note(chatKey, ids);
     // The bytes kept here are the prefix-block hashes, not layer KV. Reusing
     // K and V would change per-column int8 scales, so the pass still recomputes.
     const hashBytes = new Uint8Array(new Uint32Array(prefixIndex.blocks(ids)).buffer);
-    if (!kvSpill.put(CHAT, hashBytes)) log("prefix record is larger than the spill cap; this chat is not retained.");
+    if (!kvSpill.put(chatKey, hashBytes)) log("prefix record is larger than the spill cap; this chat is not retained.");
     if (typeof indexedDB !== "undefined") {
       const open = indexedDB.open("daisychain-infer", 1);
       open.onupgradeneeded = () => open.result.createObjectStore("prefix");
       open.onsuccess = () => {
         const db = open.result;
-        db.transaction("prefix", "readwrite").objectStore("prefix").put(hashBytes, CHAT);
+        db.transaction("prefix", "readwrite").objectStore("prefix").put(hashBytes, chatKey);
       };
     }
     const promptLen = ids.length;
@@ -822,12 +846,14 @@ async function generate(isReplay) {
     const tStart = performance.now();
     let hops = 0;
 
-    const useChunks = plan.length > 1 && ids.length > 32;
+    stageObj.pass = willChunk ? "chunk" : "window";
+    actIn.clear();
+    const useChunks = willChunk;
     let chunkedIds = null;
     if (useChunks) {
-      log(`overlap prefill: ${ids.length} prompt tokens, chunks of 16, 2 in flight. ` +
-          `Each stage keeps KV for its own layers. This is not the full-window GEMM.`);
       const chunks = Shard.prefillChunks(ids.length, 16, 2);
+      log(`overlap prefill: ${ids.length} prompt tokens as [${chunks.chunks.map(c => c.hi - c.lo).join("+")}], ` +
+          `${chunks.window} in flight. Each stage keeps KV for its own layers. This is not the full-window GEMM.`);
       const span = { cache: [], pos0: 0, li: 0 };
       const hop = async (index, hidden) => {
         await sendTo(plan[1].id, packAct(seq, index, plan[1].index, hidden));
@@ -872,13 +898,10 @@ async function generate(isReplay) {
 
     if (!useChunks) {
     for (let produced = 0; produced < nTok && !abortRun; ) {
-      let draft = Shard.promptLookupDraft(ids, 4);
-      const seqIds = ids.concat(draft);
-      const shown = seqIds.slice(-T);
-      const shownDraft = Math.min(draft.length, Math.max(0, shown.length - 1));
-      draft = draft.slice(draft.length - shownDraft);
+      const frame = Shard.lookaheadFrame(ids, T, 4);
+      const draft = frame.draft;
       const win = new Int32Array(T);
-      for (let i = 0; i < shown.length; i++) win[T - shown.length + i] = shown[i];
+      for (let i = 0; i < frame.win.length; i++) win[T - frame.win.length + i] = frame.win[i];
       let x = Infer.embed(stageObj, win);
       x = await Infer.runLayers(stageObj, x);
       if (auditFailure) { log(`KERNEL AUDIT FAILED: ${auditFailure} — stopping`); break; }
@@ -891,7 +914,7 @@ async function generate(isReplay) {
         if (!ok) throw new Error("stalled");
         x = actIn.get(key); actIn.delete(key);
       }
-      const rows = Infer.draftRows(T, shown.length, draft.length);
+      const rows = Infer.draftRows(T, frame.shown, draft.length);
       const picked = (await Infer.logitsAt(stageObj, x, rows)).map(l => Infer.pickToken(l, opts));
       const got = Shard.acceptDraft(picked, draft);
       if (draft.length) log(`draft span ${draft.length}, accepted ${Math.max(0, got.length - 1)} before the bonus token. One lap.`);
@@ -1031,6 +1054,7 @@ function kernelCtx() {
 
   await measureCapacity();
   log(`measured capacity: ${myCapacity.toFixed(0)} verified GEMMs/sec — this decides how many layers this device takes`);
+  restorePrefixes();
 
   ui.me.textContent = deviceName;
   if (!hfToken) setToken(null);                  // keep a token adopted from the fragment

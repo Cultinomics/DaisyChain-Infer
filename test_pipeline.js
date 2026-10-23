@@ -207,6 +207,12 @@ const GPT2 = Arch.fromConfig({
     const fast = Shard.estimateLapMs(spec, 8, 1000);
     assert.ok(slow > fast, "a longer window on a slower device must cost more");
     assert.ok(fast > 0);
+    const solo = Shard.estimatePlanMs(spec, 32, [{ lo: 0, hi: spec.layers, head: true, capacity: 1000 }]);
+    const ring = Shard.estimatePlanMs(spec, 32, [
+      { lo: 0, hi: 3, head: true, capacity: 1000 },
+      { lo: 3, hi: spec.layers, head: false, capacity: 10 },
+    ]);
+    assert.ok(ring > solo, "a slow stage must raise the lap estimate");
   });
 
   await t("a short prompt stays local only when the head can hold the model", async () => {
@@ -215,7 +221,7 @@ const GPT2 = Arch.fromConfig({
     assert.strictEqual(Shard.headCanHold(spec, tensors, 0), false);
     assert.strictEqual(Shard.headCanHold(spec, tensors, 8), true);
     assert.strictEqual(Shard.preferLocal(16, 2, true), true);
-    assert.strictEqual(Shard.preferLocal(128, 2, true), false);
+    assert.strictEqual(Shard.preferLocal(128, 2, true), true);
     assert.strictEqual(Shard.preferLocal(16, 2, false), false);
     assert.strictEqual(Shard.preferLocal(16, 0, true), false);
   });
@@ -223,8 +229,13 @@ const GPT2 = Arch.fromConfig({
   await t("prefix blocks match a continuation and the spill evicts the oldest block", async () => {
     const idx = Shard.makePrefixIndex(4);
     const a = [1, 2, 3, 4, 5, 6, 7, 8];
+    const kept = [1, 2, 3, 4, 5];
+    idx.restore("kept", idx.blocks(kept).slice(0, 1));
+    assert.strictEqual(idx.matchedBlocks("kept", kept.concat([6])), 1);
     idx.note("chat", a);
+    idx.note("other", [9, 9, 9, 9, 8]);
     assert.strictEqual(idx.matchedBlocks("chat", a.concat([9])), 2);
+    assert.strictEqual(idx.matchedBlocks("other", [9, 9, 9, 9, 1]), 1);
     assert.strictEqual(idx.matchedBlocks("chat", [9, 9, 9, 9]), 0);
     const spill = Shard.makeKvSpill(12);
     assert.strictEqual(spill.put("a", new Uint8Array(8)), true);
@@ -237,7 +248,12 @@ const GPT2 = Arch.fromConfig({
   await t("prefill chunks, prompt-lookup drafts, and accept keep a bonus token", async () => {
     const c = Shard.prefillChunks(40, 16, 2);
     assert.strictEqual(c.chunks.length, 3);
-    assert.deepStrictEqual([c.chunks[2].lo, c.chunks[2].hi], [32, 40]);
+    assert.deepStrictEqual(c.chunks.map(x => x.hi - x.lo), [14, 13, 13]);
+    assert.strictEqual(c.chunks[2].hi, 40);
+    assert.strictEqual(c.chunks[0].lo, 0);
+    const frame = Shard.lookaheadFrame([1, 2, 3, 9, 1, 2, 3], 16, 4);
+    assert.deepStrictEqual(frame.draft, [9]);
+    assert.strictEqual(frame.win.length, 8);
     assert.strictEqual(c.window, 2);
     const ids = [1, 2, 3, 9, 1, 2, 3];
     assert.deepStrictEqual(Shard.promptLookupDraft(ids, 4), [9]);

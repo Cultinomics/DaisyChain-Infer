@@ -308,11 +308,11 @@
     const spans = stages.map(() => ({ cache: [], pos0: 0, li: 0 }));
     const size = Math.max(1, chunkSize | 0);
     let last = null;
-    for (let lo = 0; lo < ids.length; lo += size) {
-      const piece = ids.slice(lo, Math.min(ids.length, lo + size));
-      let x = embedRows(stages[0], piece, lo);
+    for (const ch of SH.prefillChunks(ids.length, size, 1).chunks) {
+      const piece = ids.slice(ch.lo, ch.hi);
+      let x = embedRows(stages[0], piece, ch.lo);
       for (let s = 0; s < stages.length; s++) {
-        spans[s].pos0 = lo;
+        spans[s].pos0 = ch.lo;
         x = await runLayersChunk(stages[s], x, spans[s]);
       }
       last = x;
@@ -388,16 +388,13 @@
     const maxDraft = opts && opts.maxDraft != null ? opts.maxDraft : 4;
     let produced = 0;
     while (produced < nNew) {
-      let draft = SH.promptLookupDraft(ids, maxDraft);
-      const seqIds = ids.concat(draft);
-      const shown = seqIds.slice(-T);
-      const shownDraft = Math.min(draft.length, Math.max(0, shown.length - 1));
-      draft = draft.slice(draft.length - shownDraft);
+      const frame = SH.lookaheadFrame(ids, T, maxDraft);
+      const draft = frame.draft;
       const win = new Int32Array(T);
-      for (let i = 0; i < shown.length; i++) win[T - shown.length + i] = shown[i];
+      for (let i = 0; i < frame.win.length; i++) win[T - frame.win.length + i] = frame.win[i];
       let x = embed(head, win);
       for (const S of stages) x = await runLayers(S, x);
-      const rows = draftRows(T, shown.length, draft.length);
+      const rows = draftRows(T, frame.shown, draft.length);
       const picked = [];
       for (const logits of await logitsAt(head, x, rows)) picked.push(pickToken(logits, opts));
       const got = SH.acceptDraft(picked, draft);

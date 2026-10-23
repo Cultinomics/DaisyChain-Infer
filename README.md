@@ -14,6 +14,23 @@ tags:
 **Part of DaisyChain on 🤗 Hugging Face → https://huggingface.co/DaisyChainAI**
 **Live Space:** https://huggingface.co/spaces/Quazim0t0/DaisyChain-Infer
 
+## Added 2026-10-22
+
+The rest of this file is the previous README. Everything in this list, and every later note marked *(added 2026-10-22)*, is new.
+
+- Compute cores copied from live DaisyChain-Train, Hub revision `a28437c` (20 October 2026). Lookup tables unchanged.
+- A non-finite activation throws `NonFiniteError` and is not forwarded. The same cores refuse an int32 accumulator that would wrap, and a non-finite gradient before DaisyAdam.
+- A peer whose kernel probe disagrees is left out of the plan.
+- Layers stay split by measured GEMMs/sec, so a slower device gets fewer layers.
+- Lap budget uses `estimatePlanMs`: each stage's share of the model, at that stage's own rate, after the plan is final. Above 120 seconds per token the run stops before any download.
+- A second prompt is queued. The turn already generating keeps the ring.
+- If `navigator.deviceMemory` says the whole model fits in a quarter of that RAM, the turn stays on the head. Unknown memory uses the ring.
+- A 64-token prefix hash is kept per conversation, keyed by the first block, written to IndexedDB, and read back when the page loads. Two chats do not wipe each other. The full-window pass still recomputes a matched prefix. Oldest record drops at 32 MB.
+- Prompt longer than 32 tokens, more than one device: even chunks of about 16 tokens, two in flight, per-stage KV. Not bit-identical to the full-window GEMM. Verify reruns this path. The assignment field `pass` is `chunk` or `window`. Stages do not guess from the activation length.
+- Full-window path: a repeated suffix is drafted and scored in one lap (`lookaheadFrame`). Matches are kept, plus the first disagreement.
+- One weight range stays in flight while the previous body is widened to f32.
+- A planned peer other than the head dropping, or a stalled lap, replays the prompt once. Weights still come from the Hub.
+
 ---
 
 > **In plain terms:** point it at a Hugging Face model, open the page on two or
@@ -63,6 +80,23 @@ real rather than a redistribution of something one machine already had to load.
 Running SmolLM-135M across three devices, each downloads and holds 135–243 MB
 of a 513 MB model, and the activation moving between them is tens of KB. That
 asymmetry is why this works.
+
+## Scheduling *(added 2026-10-22)*
+
+The compute units are the live DaisyChain-Train browser cores (Hub revision `a28437c`, 20 October 2026), not the older snapshot this repo shipped with. A non-finite activation throws `NonFiniteError` before any layer runs, and the next stage does not forward it. The same cores refuse an int32 accumulator that would wrap, and they refuse a non-finite gradient before DaisyAdam. The lookup tables did not change.
+
+On top of that, the head does a few things the old loop did not:
+
+- A peer whose kernel probe disagrees is left out of the plan, not only warned.
+- Layers are still split by measured GEMMs/sec, so a slower device gets fewer layers.
+- Before any weight download, `estimatePlanMs` sums each stage's share at that stage's own rate. Above **120 seconds** per token the run stops. *(added 2026-10-22)*
+- A second prompt while a turn is generating is queued. The turn already on the ring finishes first.
+- If `navigator.deviceMemory` says the whole model fits in a quarter of that RAM, the turn runs on the head and the ring is not used. Unknown memory uses the ring. A split that the head can hold only adds a hop.
+- A **64-token** block hash is kept per conversation, keyed by the first block, in memory and in IndexedDB when the browser has it. Two chats do not wipe each other's record. The oldest record is dropped at **32 MB**. The full-window pass still recomputes. A prefix hit is logged and then computed again, because reusing K and V would change the per-column int8 scales.
+- With more than one device and a prompt longer than **32 tokens**, prefill goes out in even chunks of about **16** tokens, two chunks in flight. A short tail is not left as its own hop. Each stage keeps K and V for its own layers. Decode stays one new token per lap. This path is not bit-identical to one full-window GEMM. Verify reruns the same chunked path.
+- On the full-window path, a repeated suffix proposes the tokens that followed the earlier copy (prompt lookup, no second model). One lap scores that span. Matching drafts are kept, plus the first token that disagreed. If nothing repeats, the lap still produces one token.
+- Weight fetches keep one HTTP range in flight while the previous body is widened to f32. The bytes are the same.
+- If a peer disconnects or a lap stalls, the head drops that peer, replans, and reruns the prompt **once** from the start. Weights still come from the Hub, not from another device.
 
 ## The ring
 
@@ -145,7 +179,7 @@ Four things close that:
 
 1. **The kernel probe**, which matters more here than in the trainer — the same
    seeded GEMM on every device, so it stays comparable even when the real work is
-   not. A stage whose probe disagrees is flagged before it is given layers.
+   not. A stage whose probe disagrees is left out of the plan. *(added 2026-10-22)*
 2. **Activation integrity hashes** on every hop, plus the model fingerprint, so a
    stage still holding a slice of a *different* model refuses the hop instead of
    silently mixing two models.
@@ -161,6 +195,10 @@ architecture families, across several uneven splits including a head that keeps
 no layers. Two cases are mutation checks — a stage that silently drops a layer,
 and stages applied out of order — both of which *must* fail the comparison.
 Without those, a test where both sides call the same code proves nothing.
+*(added 2026-10-22)* The same file checks that a disagreeing probe is dropped, that a non-finite
+activation is refused, that a chunked prefill matches across a split, and that
+a lookahead draft matches across a split. The chunked path is compared to
+itself, not to the full-window GEMM.
 
 Confirmed on a real model too: SmolLM-135M's 30 layers split `[10,10,10]`,
 `[1,14,15]`, `[0,15,15]` and `[5,5,5,5,5,5]` all produced token sequences
@@ -198,13 +236,13 @@ public/safetensors.js     header parsing, exact BF16/F16 widening, range coalesc
 public/hf.js              Hub client: range reads, gated repos, token redaction
 public/arch.js            config.json -> normalized spec; per-family tensor names
 public/tokenizer.js       byte-level BPE from the repo's own tokenizer.json
-public/shard.js           the plan, per-stage tensor sets, weight-layout handling
-public/infer.js           forward pass: embed / runLayers / readout
+public/shard.js           the plan, probe filter, lap estimate, prefix index, drafts   (added 2026-10-22)
+public/infer.js           forward pass, chunked prefill, lookahead readout          (added 2026-10-22)
 public/wire.js            binary protocol + routing, as pure functions
-public/app.js             WebRTC mesh, assignments, credentials, token loop
-public/verified_core.js   the verified INT8 units      (unchanged from DaisyChain-Web)
-public/webgpu.js          WGSL kernels + exact gates   (unchanged)
-public/*.bin              the units as lookup tables   (unchanged)
+public/app.js             WebRTC mesh, assignments, queue, replay, token loop       (added 2026-10-22)
+public/verified_core.js   the verified INT8 units      (copied from live DaisyChain-Train, 2026-10-22)
+public/webgpu.js          WGSL kernels + exact gates   (copied from live DaisyChain-Train, 2026-10-22)
+public/*.bin              the units as lookup tables   (unchanged; same as Train)
 test_pipeline.js          split vs unsplit, bit-exact, both families
 test_wire.js              protocol round-trips, refusals, ring routing
 test_loader.js            safetensors, dtype widening, BPE
@@ -216,12 +254,14 @@ docs/                     GETTING_STARTED, ARCHITECTURE
 - **Latency, not bandwidth, is the cost.** Every token pays one round trip per
   stage. More stages buy capacity, not speed — expect tokens/sec to *fall* as you
   add devices.
-- **No KV cache.** Every token re-runs the whole window, which is also what keeps
-  the split bit-comparable against an unsplit run.
+- **The full-window path has no KV cache.** *(added 2026-10-22, replaces "No KV cache".)* Every token re-runs the window, which
+  is what keeps that path bit-comparable against an unsplit run. A long prompt on
+  a multi-device ring uses the chunked path instead, and that path is a different
+  number.
 - **f32 in memory.** Weights are widened from F16/BF16 on load, so a stage costs
   4 bytes per parameter it holds.
-- **The head is a single point of failure**, and a stage that drops stalls the
-  ring; press Generate again to re-plan around whoever is still connected.
+- **The head is a single point of failure.** *(added 2026-10-22.)* A stage that drops is removed and the
+  prompt is replayed once. If that also fails, press Generate again.
 - **No authentication of activations.** A malicious stage that runs correct math
   but returns a crafted activation is not caught by any of this. Peers see each
   other's IPs, and the head sees your prompt. Ring with people you trust.

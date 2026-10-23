@@ -3,6 +3,14 @@
 This is a local project. There is no hosted version — you clone it and run it
 on your own machines.
 
+## Added 2026-10-22
+
+The rest of this file is the previous getting-started note. This list is what changed.
+
+- Context length still defaults to 64. A prompt longer than 32 tokens on a multi-device ring uses even chunked prefill. If this device can hold the whole model, the ring is not used.
+- New log lines: lap estimate for the whole plan, queued prompts, overlap prefill, draft span. A disagreeing probe is left out of the plan.
+- New failures: "a peer left the ring" (one replay), "REFUSED activation" for a non-finite hop, "refusing the run" when the lap estimate exceeds 120 seconds, "stays out of the plan: kernel probe".
+
 ## Run the server
 
 ```bash
@@ -87,7 +95,7 @@ The first person in is the **host** and approves each device individually.
 | Setting | Default | What it does |
 |---|---|---|
 | Tokens | 60 | how many to generate |
-| Context length | 64 | window size; the main cost per token (there is no KV cache) |
+| Context length | 64 | *(added 2026-10-22)* full-window size; the main cost per token on that path. A prompt longer than 32 tokens on a multi-device ring uses even chunked prefill instead. If this device can hold the whole model, the ring is not used |
 | Temperature ÷100 | 0 | 0 = greedy, deterministic and therefore checkable |
 | Seed | 1234 | drives sampling above temperature 0, so runs stay reproducible |
 | Verify | off | afterwards, re-run with every layer here and compare |
@@ -101,9 +109,16 @@ few layers and no vocabulary.
   stages: each one adds a round trip per token. More stages buy capacity, not
   speed.
 - **ring hops** — stages × tokens.
-- **kernel probe** (in the log) — the same number on every honest device,
-  whatever its backend. A peer reporting a different one is computing different
-  arithmetic, and the log says so.
+- **kernel probe** (in the log) — *(added 2026-10-22)* the same number on every device that is
+  allowed into the plan. A peer reporting a different one is left out.
+- **lap estimate** — *(added 2026-10-22)* milliseconds per token for the plan that will actually
+  run, each stage at its own rate. Above 120 seconds the run is refused
+  before the download.
+- **queued** — *(added 2026-10-22)* a prompt typed while a turn is generating. It starts when the
+  ring is free.
+- **overlap prefill** — *(added 2026-10-22)* chunks of about 16, two in flight, per-stage KV. Not the
+  full-window GEMM. Verify repeats this path.
+- **draft span** — *(added 2026-10-22)* a repeated suffix scored in one lap on the full-window path.
 - **my slice** — which layers this device holds and how much memory they take.
 
 ## Verify
@@ -127,8 +142,11 @@ npm test
 
 ## When it goes wrong
 
-- **"the ring stalled at token N"** — a stage went quiet. Press Generate again
-  to re-plan around whoever is still connected.
+- *(added 2026-10-22)* **"a peer left the ring"** — the head replans and replays the prompt once.
+  If the replay also fails, press Generate again.
+- *(added 2026-10-22)* **"REFUSED activation"** — a non-finite hop. It is not forwarded.
+- *(added 2026-10-22)* **"refusing the run: estimated … ms per token"** — the lap budget of 120
+  seconds was exceeded. Add a faster device or lower the context length.
 - **"unsupported architecture"** — the model is not Llama-style or
   GPT-2-style.
 - **"tokenizer type … is not supported"** — the repo uses SentencePiece or
@@ -139,8 +157,8 @@ npm test
   a slice; refused rather than accepted, since that defeats the point.
 - **"REFUSED activation … belongs to model X"** — a stage still holds a slice
   of a previous model. Reload that device.
-- **"⚠ … disagrees with this device's kernel probe"** — that device's
-  arithmetic differs from yours. Do not give it layers.
+- *(added 2026-10-22)* **"stays out of the plan: kernel probe"** — that device's arithmetic
+  differs. It is not given layers.
 - **out of memory** — the stage's slice does not fit. Add devices, or pick a
   smaller model; the plan shows the per-device cost before you start.
 

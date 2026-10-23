@@ -163,6 +163,21 @@
   // count below is the MAC volume of one window through every layer, divided
   // by that unit. It is there to refuse a split that cannot produce a token
   // in `budgetMs`, before any weight download.
+  // Serial time of one lap on this plan. Each stage pays for the layers it
+  // holds, at its own measured rate. A slow stage with a real share of the
+  // layers dominates. The head with no layers still pays a small share for
+  // the embedding and the readout.
+  function estimatePlanMs(spec, T, stages) {
+    const layers = Math.max(spec.layers, 1);
+    let ms = 0;
+    for (const s of stages) {
+      const owned = Math.max(0, (s.hi | 0) - (s.lo | 0));
+      const share = owned > 0 ? owned / layers : (s.head ? 0.05 : 0);
+      ms += estimateLapMs(spec, T, s.capacity || 0) * share;
+    }
+    return ms;
+  }
+
   function estimateLapMs(spec, T, gemmPerSec) {
     const unit = 32 * 64 * 64;
     const C = spec.hidden;
@@ -186,10 +201,10 @@
     return bytes < deviceGB * 0.25 * 1073741824;
   }
 
-  // A short prompt stays on the head when the head can hold every layer.
-  // The ring still exists for prompts that do not fit that rule.
+  // If the head can hold every layer, the ring only adds a hop. Run here.
+  // Unknown memory leaves `fits` false, so the ring is used rather than guessed.
   function preferLocal(promptTokens, peerCount, fits) {
-    return !!(fits && peerCount > 0 && promptTokens > 0 && promptTokens <= 64);
+    return !!(fits && peerCount > 0 && promptTokens > 0);
   }
 
   // Rolling FNV blocks over token ids. This is the approximate prefix index:
@@ -212,6 +227,7 @@
       blockSize: B,
       blocks,
       note(session, ids) { sessions.set(session, blocks(ids)); },
+      restore(session, hashes) { sessions.set(session, hashes.slice()); },
       matchedBlocks(session, ids) {
         const prev = sessions.get(session);
         if (!prev) return 0;
@@ -260,12 +276,23 @@
   // Prompt chunks for a pipelined prefill. `window` is how many chunks may be
   // in flight across the ring at once. Decode stays one token, one lap:
   // the next token is not known until the lap returns.
+  // Chunks are as even as the token count allows. A fixed size leaves a short
+  // tail, and the tail still pays a full hop while the other stages wait.
   function prefillChunks(nTokens, chunkSize, inFlight) {
     const size = Math.max(1, chunkSize | 0);
     const window = Math.max(1, inFlight | 0);
+    const n = Math.max(1, Math.ceil(Math.max(nTokens, 1) / size));
+    const base = Math.floor(nTokens / n);
+    let rem = nTokens - base * n;
     const chunks = [];
-    for (let lo = 0; lo < nTokens; lo += size)
-      chunks.push({ index: chunks.length, lo, hi: Math.min(nTokens, lo + size) });
+    let lo = 0;
+    for (let i = 0; i < n; i++) {
+      const len = base + (rem > 0 ? 1 : 0);
+      if (rem > 0) rem--;
+      if (len < 1) break;
+      chunks.push({ index: chunks.length, lo, hi: lo + len });
+      lo += len;
+    }
     return { chunks, window, chunkSize: size };
   }
 
@@ -295,6 +322,17 @@
 
   // picked[i] proposes draft[i]. picked has one extra entry: the token at the
   // first position that rejected, which is always kept.
+  // One description of the window both the ring and the local check run.
+  // `win` is the token ids placed at the right edge of a context of length T.
+  function lookaheadFrame(ids, T, maxDraft) {
+    let draft = promptLookupDraft(ids, maxDraft);
+    const seqIds = ids.concat(draft);
+    const shown = seqIds.slice(-T);
+    const shownDraft = Math.min(draft.length, Math.max(0, shown.length - 1));
+    draft = draft.slice(draft.length - shownDraft);
+    return { draft, shown: shown.length, win: shown.slice() };
+  }
+
   function acceptDraft(picked, draft) {
     const out = [];
     let i = 0;
@@ -306,7 +344,8 @@
   const api = { planStages, stageBytes, stageWeights, toKN, transposeEmb,
                 fnv1a, hashF32, modelFingerprint, ringMembers, estimateLapMs,
                 headCanHold, preferLocal, makePrefixIndex, makeKvSpill,
-                prefillChunks, promptLookupDraft, acceptDraft };
+                prefillChunks, promptLookupDraft, acceptDraft, lookaheadFrame,
+                estimatePlanMs };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.Shard = api;
 })(typeof self !== "undefined" ? self : this);

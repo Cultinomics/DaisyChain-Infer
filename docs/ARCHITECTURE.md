@@ -3,6 +3,18 @@
 How a page load becomes one stage of a model, and how a token gets produced by
 several machines that each hold only part of it.
 
+## Added 2026-10-22
+
+The rest of this file is the previous architecture note. This list is what changed.
+
+- A disagreeing kernel probe is removed before apportionment (`ringMembers`).
+- `estimatePlanMs` is the lap budget: each stage's share at that stage's rate. Above 120000 ms the run is refused.
+- Assignments carry `pass`: `chunk` or `window`. Stages do not infer the path from the row count.
+- The next weight range is fetched while the previous body is widened to f32.
+- Full-window laps can score a prompt-lookup draft of at most 4 tokens in one window.
+- Prompts longer than 32 tokens on more than one stage use even chunks of about 16, two in flight, with per-stage KV. Not the full-window GEMM.
+- A second prompt is queued. A dropped planned peer or a stalled lap replays the prompt once. A non-finite hidden state is not forwarded.
+
 ## The pieces
 
 | File | Role |
@@ -68,6 +80,17 @@ Apportionment is largest-remainder, so it is a pure function of the capacity
 report: every device derives the same plan from the same inputs, and the plan
 never has to be trusted, only compared. A device that ends up with zero blocks
 is dropped from the ring unless it is the head — an empty hop is pure latency.
+*(added 2026-10-22)* A peer whose kernel probe hash disagrees with the head is removed before that
+apportionment (`ringMembers`). The head is always kept.
+
+*(added 2026-10-22)* Before the download, `estimatePlanMs` sums each stage's share of
+`estimateLapMs` at that stage's own GEMM rate. A slow stage with a real share
+of the layers raises the figure. It is a budget check. Above 120000 ms the
+head refuses the run. It is not a latency model.
+
+*(added 2026-10-22)* The assignment may set `pass` to `chunk` or `window`. Stages must not guess
+the path from the activation length: a chunk can be exactly `T` rows, and
+treating it as a full window would drop the KV the other stages kept.
 
 `unpackAssign` refuses any plan whose stages do not cover every layer exactly
 once, and any plan whose stage 0 is not the head. A gap there would not throw
@@ -84,7 +107,9 @@ credentials. Weights never travel between peers, which means:
 - no device needs to hold the whole model, not even the head;
 - a token is never sent over the wire — each device is prompted separately;
 - adjacent byte ranges are coalesced, so a stage costs roughly one request
-  rather than nine per layer.
+  rather than nine per layer;
+- *(added 2026-10-22)* the next range is requested while the previous body is widened to f32.
+  The bytes do not change.
 
 ## One token
 
@@ -100,6 +125,28 @@ credentials. Weights never travel between peers, which means:
 The head is both stage 0 and the terminus, so the return leg has its own
 address rather than a stage index. Reading it as "stage 0, your turn" was a
 real bug: the head re-ran its own layers and the lap never closed.
+
+*(added 2026-10-22)* Two other ways a lap can start:
+
+- **Full window, with a draft.** If a suffix of the token ids already occurred
+  earlier, the head appends the tokens that followed that copy (at most 4) and
+  reads logits at each of those rows plus one. Matches are kept. The first
+  disagreement is kept too. An empty draft is one new token, the same window
+  as before. `runLayers` still sees the whole window, so this path stays on
+  the bit-exact GEMM.
+- **Chunked prefill.** Prompt longer than 32 tokens, and more than one stage.
+  Even chunks of about 16 tokens, two in flight. A short tail is folded into
+  those chunks so it is not its own hop. `runLayersChunk` appends K and V on the stage
+  that owns those layers and attends only the new rows. Decode after that is
+  one new token per lap on the same cache. Per-column int8 scales move as the
+  cache grows, so this is not bit-identical to the full-window GEMM. A split
+  of the chunked path matches itself. `tokenIdx` is the chunk index, and a
+  stage applies chunks in order even if a later chunk arrives first.
+
+A second prompt while a run is in progress is queued. If the activation wait
+fails or a peer channel closes, the head drops that peer, rebuilds the plan,
+and reruns the prompt once. A non-finite hidden state throws inside
+`runLayers` / `runLayersChunk` and is not forwarded.
 
 ## The wire
 

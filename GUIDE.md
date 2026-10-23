@@ -11,6 +11,21 @@ where available, the identical math on CPU where not.
 **This runs locally.** It is a project you clone and start on your own
 machines; there is no hosted deployment, and it is not a Space.
 
+## Added 2026-10-22
+
+The rest of this file is the previous guide. This list, and every later note marked *(added 2026-10-22)*, is new.
+
+- Compute cores from DaisyChain-Train `a28437c`. Non-finite activations are refused.
+- A disagreeing kernel probe is left out of the plan.
+- Lap budget is the plan, each stage at its own rate. Above 120 seconds per token the run stops before download.
+- A second prompt waits.
+- If the browser reports enough RAM for the whole model, the turn stays on the head.
+- A 64-token prefix hash is kept per conversation and read back on load. The full-window pass still recomputes it.
+- Long multi-device prompts use even chunks of about 16 tokens, two in flight, with per-stage KV. Verify reruns that path.
+- A repeated suffix is drafted and scored in one lap on the full-window path.
+- One weight range stays in flight while the previous body is widened to f32.
+- A dropped peer or a stalled lap is replayed once. Weights still come from the Hub.
+
 ```bash
 npm install
 npm start            # http://localhost:8788
@@ -47,6 +62,21 @@ the one driving the run — ever holds the whole model.
 Running SmolLM-135M across three devices, each one downloads and holds
 135–243 MB of a 513 MB model. The activation moving between them is tens of KB.
 That asymmetry is why this works.
+
+## Scheduling *(added 2026-10-22)*
+
+The compute units are the live DaisyChain-Train browser cores (Hub revision `a28437c`, 20 October 2026). A non-finite activation throws `NonFiniteError` and is not forwarded.
+
+- A peer whose kernel probe disagrees is left out of the plan.
+- Layers are still split by measured GEMMs/sec.
+- Above **120 seconds** per estimated token, the run stops before any weight download.
+- A second prompt waits. The turn already generating keeps the ring.
+- If the browser reports enough RAM for the whole model, the turn stays on the head. Unknown RAM uses the ring.
+- A **64-token** prefix hash is recorded per conversation, keyed by the first block, so two chats do not erase each other. The full-window pass still recomputes it.
+- A prompt longer than **32 tokens** on more than one device is prefetched in even chunks of about **16** tokens, two in flight, with per-stage KV. That path is not the full-window GEMM. Verify reruns the chunked path.
+- On the full-window path, a repeated suffix is drafted and scored in one lap. Matching drafts are kept, plus the first disagreement.
+- One weight range stays in flight while the previous body is widened to f32.
+- A dropped peer or a stalled lap is replayed **once** from the start. Weights still come from the Hub.
 
 ## The ring
 
@@ -124,7 +154,7 @@ Four things close that:
 
 1. **The kernel probe**, which matters more here than in the trainer — the same
    seeded GEMM on every device, so it stays comparable even when the real work
-   is not. A stage whose probe disagrees is flagged before it is given layers.
+   is not. A stage whose probe disagrees is left out of the plan. *(added 2026-10-22)*
 2. **Activation integrity hashes** on every hop, plus the model fingerprint, so
    a stage still holding a slice of a *different* model refuses the hop instead
    of silently mixing two models.
@@ -145,6 +175,9 @@ architecture families, across several uneven splits including a head that keeps
 no layers. Two cases are mutation checks — a stage that silently drops a layer,
 and stages applied out of order — both of which *must* fail the comparison.
 Without those, a test where both sides call the same code proves nothing.
+*(added 2026-10-22)* The same file also checks a dropped probe, a refused non-finite activation,
+a chunked prefill across a split, and a lookahead draft across a split. The
+chunked path is compared to itself, not to the full-window GEMM.
 
 This was also confirmed against a real model: SmolLM-135M's 30 layers split
 `[10,10,10]`, `[1,14,15]`, `[0,15,15]` and `[5,5,5,5,5,5]` all produced token
@@ -179,13 +212,14 @@ behaviour; it was checked.
 - **Latency, not bandwidth, is the cost.** Every token pays one round trip per
   stage. More stages buy capacity, not speed — expect tokens/sec to *fall* as
   you add devices.
-- **No KV cache.** Every token re-runs the whole window, which is also what
-  keeps the split bit-comparable against an unsplit run. Context length is the
-  dominant per-token cost.
+- **The full-window path has no KV cache.** *(added 2026-10-22, replaces "No KV cache".)* Every token re-runs the window, which
+  is what keeps that path bit-comparable against an unsplit run. Context length
+  is the dominant per-token cost. A long multi-device prompt uses chunked
+  prefill instead, and that is a different number.
 - **f32 in memory.** Weights are widened from F16/BF16 on load, so a stage
   costs 4 bytes per parameter it holds.
-- **The head is a single point of failure**, and a stage that drops stalls the
-  ring; press Generate again to re-plan around whoever is still connected.
+- **The head is a single point of failure.** *(added 2026-10-22.)* A stage that drops is removed and the
+  prompt is replayed once. If that also fails, press Generate again.
 - **No authentication of activations.** A malicious stage that runs correct
   math but returns a crafted activation is not caught by any of this — the
   verification proves the *computation* is right on every honest device. Peers

@@ -8,7 +8,26 @@
 
   let TC;   // TrainCore (matmul/transpose) — resolved per environment at the end
 
+  // A float -> int8 conversion has no answer for NaN/Inf, and the quantizers below give a
+  // silent wrong one: an Inf makes the |max| scale Infinity and EVERY value quantizes to 0
+  // ([0.5, Inf, 3] -> [0, 0, 0]); a NaN is skipped by `a > mx` and then stored as 0 by the
+  // Int8Array. The Python trainer refuses the same input (qat.py); so does this. One pass,
+  // no effect on finite inputs, so builds with and without it still co-train.
+  function assertFinite(X, where) {
+    for (let i = 0; i < X.length; i++) {
+      if (!Number.isFinite(X[i])) {
+        let bad = 0;
+        for (let j = i; j < X.length; j++) if (!Number.isFinite(X[j])) bad++;
+        const e = new Error("non-finite input to " + where + " (" + bad + " of " + X.length +
+                            " values): the int8 quantize would turn it into 0");
+        e.name = "NonFiniteError";
+        throw e;
+      }
+    }
+  }
+
   function quantize(X) {
+    assertFinite(X, "quantize");
     let mx = 0; for (let i = 0; i < X.length; i++) { const a = Math.abs(X[i]); if (a > mx) mx = a; }
     const scale = Math.max(mx / 127, 1e-8);
     const q = new Int8Array(X.length);
@@ -16,8 +35,22 @@
     return { q, scale };
   }
 
+  // int32 accumulator headroom: |a*b| <= 128*128, so K*16384 must fit in int32. Same bound as
+  // the Python kernel (kernel.MAX_INT32_K). The Int32Array accumulators here WRAP exactly like
+  // WGSL i32, so CPU and GPU peers would agree -- on a silently wrong sum. Refuse instead.
+  const MAX_INT32_K = Math.floor((2 ** 31 - 1) / (128 * 128));      // 131071
+  function accBound(k, where) {
+    if (k > MAX_INT32_K) {
+      const e = new Error(where + ": contraction length " + k + " exceeds the int32 accumulator " +
+                          "headroom " + MAX_INT32_K + " (the sum would wrap)");
+      e.name = "AccumulatorBoundError";
+      throw e;
+    }
+  }
+
   // int8 matmul via the verified multiply LUT: acc(m×n) = sum_k mulLUT[Xq,Wq]
   function lutMatmulJS(Xq, Wq, m, k, n, L) {
+    accBound(k, "lutMatmulJS");
     const C = new Int32Array(m * n), mul = L.mul;
     for (let i = 0; i < m; i++) {
       for (let p = 0; p < k; p++) {
@@ -73,6 +106,7 @@
   // outlier no longer crushes the quantization resolution of every other
   // row/column. One LUT pass at this granularity beats the per-tensor 3-pass.
   function quantizeRows(X, rows, cols) {
+    assertFinite(X, "quantizeRows");
     const q = new Int8Array(rows * cols), s = new Float32Array(rows);
     for (let r = 0; r < rows; r++) {
       let mx = 0;
@@ -86,6 +120,7 @@
     return { q, s };
   }
   function quantizeCols(W, rows, cols) {
+    assertFinite(W, "quantizeCols");
     const q = new Int8Array(rows * cols), s = new Float32Array(cols);
     for (let c = 0; c < cols; c++) {
       let mx = 0;
@@ -120,6 +155,7 @@
   // (≤1 step) vs quantizeRows, so old and new builds cannot co-train — the
   // divergence guard stops such mixed groups by design.
   function rowAbsMax(X, rows, cols) {
+    assertFinite(X, "rowAbsMax");
     const mx = new Float32Array(rows);
     for (let r = 0; r < rows; r++) {
       let m = 0;
@@ -129,6 +165,12 @@
     return mx;
   }
   function scalesFromAbsMax(mx) {                // f64 divisions: exactly rounded, device-identical
+    // The GPU chain gets mx from an atomicMax over bitcast(abs(h)) and never passes through
+    // rowAbsMax, so this is where ITS non-finite guard lives: NaN bits (0x7FC00000) and Inf
+    // (0x7F800000) both order above every finite |h| as u32, so the row max is non-finite iff
+    // some element is. Before 2026-09-30 a GPU peer turned that into inv = 0/NaN and quantized
+    // floor(NaN) on the device (implementation-defined) where a CPU peer threw.
+    assertFinite(mx, "scalesFromAbsMax");
     const scale = new Float32Array(mx.length), inv = new Float32Array(mx.length);
     for (let i = 0; i < mx.length; i++) {
       scale[i] = Math.max(mx[i] / 127, 1e-8);
@@ -199,6 +241,7 @@
   function bgemmJS(Xq, Wq, rs, cs, d, L) {
     const { m, k, n } = d, batch = d.batch || 1, relu = !!d.relu, mul = L.mul;
     const raw = !!d.acc;
+    accBound(k, "bgemmJS");
     const out = raw ? new Int32Array(batch * m * n) : new Float32Array(batch * m * n);
     const acc = new Int32Array(n);
     for (let bz = 0; bz < batch; bz++) {
@@ -291,6 +334,40 @@
     return out;
   }
 
+  // ---- live audit for the split-K f32 GEMM -----------------------------------
+  // Every int8 kernel had a live-shape audit; the f32 backward GEMM -- whose
+  // output IS the embedding gradient -- had only its init gate at 7x4500x5 and
+  // 9x300x6, while training runs it at vocab x BT x C. Same remedy as auditTile:
+  // recompute a few cells (structural corners first) with the mirror's exact
+  // partition and rounding schedule, compare bit-for-bit (2026-10-14 review).
+  function fgemmCell(A, Bm, d, fma, row, col) {
+    const { m, k, n } = d, transA = !!d.transA;
+    const S = k > 4096 ? Math.min(16, Math.ceil(k / 2048)) : 1;
+    const ks = Math.ceil(k / S);
+    let acc = 0;
+    for (let z = 0; z < S; z++) {
+      const p0 = z * ks, p1 = Math.min(k, p0 + ks);
+      let s = 0;
+      for (let p = p0; p < p1; p++) {
+        const a = transA ? A[p * m + row] : A[row * k + p];
+        s = fma ? f32(s + a * Bm[p * n + col]) : f32(s + f32(a * Bm[p * n + col]));
+      }
+      acc = f32(acc + s);
+    }
+    return acc;
+  }
+  function auditFgemm(A, Bm, d, got, fma, nCells) {
+    const { m, n } = d, N = nCells || 8;
+    const edges = [[m - 1, n - 1], [0, n - 1], [m - 1, 0], [0, 0]];
+    for (let t = 0; t < N; t++) {
+      const [i, j] = t < edges.length ? edges[t] : [(Math.random() * m) | 0, (Math.random() * n) | 0];
+      const v = fgemmCell(A, Bm, d, fma, i, j);
+      if (bitDiff(got[i * n + j], v))
+        return `f32 GEMM audit failed at [${i},${j}] shape ${m}x${d.k}x${n}${d.transA ? " transA" : ""}: kernel ${got[i * n + j]} vs mirror ${v}`;
+    }
+    return null;
+  }
+
   // ---- live audits for the fused attention kernels ---------------------------
   // The attention kernels had exact INIT gates but nothing at live shapes —
   // the exact gap the GEMM audit exists to close, left open on the kernels with
@@ -379,6 +456,7 @@
   // The (BT·heads)×hd row view of q/k IS the contiguous buffer, so
   // quantizeRows(q, BT·heads, hd) gives per-(token,head) scales for free.
   function quantizeHeadCols(v, B, T, heads, hd) {   // per (batch,head,channel) column
+    assertFinite(v, "quantizeHeadCols");
     const C = heads * hd;
     const q = new Int8Array(B * T * C), s = new Float32Array(B * heads * hd);
     for (let bi = 0; bi < B; bi++)
@@ -403,6 +481,9 @@
   // d.acc=true returns the raw int32 accumulator (exact oracle for the kernel gate)
   function attScoresJS(qq, kq, qs, ks, d, L) {
     const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul, raw = !!d.acc;
+    // the WGSL kernel sums these in i32; this mirror sums in doubles. Bound both identically so
+    // a CPU peer and a GPU peer refuse the same shapes instead of one halting alone.
+    accBound(hd, "attScoresJS");
     const out = raw ? new Int32Array(B * heads * T * T) : new Float32Array(B * heads * T * T);
     for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
       const bz = bi * heads + h;
@@ -421,6 +502,7 @@
   // ctx[(bi,ti),(h,j)] = Σ_tj a[bz,ti,tj]·v[(bi,tj),(h,j)] — scatter fused into BT×C
   function attCtxJS(aq, vq, as, vs, d, L) {
     const { B, T, heads, hd } = d, C = heads * hd, mul = L.mul, raw = !!d.acc;
+    accBound(T, "attCtxJS");                       // contracts over keys, like gpuAttCtx
     const out = raw ? new Int32Array(B * T * C) : new Float32Array(B * T * C);
     for (let bi = 0; bi < B; bi++) for (let h = 0; h < heads; h++) {
       const bz = bi * heads + h;
@@ -487,10 +569,10 @@
     for (let j = 0; j < W2.length; j++) W2[j] -= lr * gAvg[W1.length + j];
   }
 
-  const api = { quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
+  const api = { assertFinite, accBound, MAX_INT32_K, quantize, quantize2, quantizeRows, quantizeCols, quantizeHeadCols, lutMatmulJS, lutMatmul3JS, lutMatmul3,
                 bgemmJS, vgemmBlock, auditTile, epi, attScoresJS, attCtxJS, linearFwd, forward, backward, splitApply,
                 rowAbsMax, scalesFromAbsMax, quantizeRowsInv, vmlpBlock, bitDiff,
-                auditAttScores, auditAttCtx, fgemmMirror };
+                auditAttScores, auditAttCtx, fgemmMirror, auditFgemm };
   if (typeof module !== "undefined" && module.exports) { TC = require("./traincore.js"); module.exports = api; }
   else { TC = root.TrainCore; root.Verified = api; }
 })(typeof self !== "undefined" ? self : this);

@@ -148,8 +148,165 @@
     return fnv1a(new TextEncoder().encode(parts.join("|")));
   }
 
+  // Peers whose kernel probe disagrees with the head are not in the ring.
+  // The head (index 0) is always kept. A missing probe is not a disagreement:
+  // the hello has not arrived yet, and buildPlan only lists peers that sent one.
+  function ringMembers(caps, probeHash) {
+    if (!caps.length) return [];
+    const head = caps[0];
+    const rest = caps.slice(1).filter(d => !probeHash || !d.probe || d.probe === probeHash);
+    return [head, ...rest];
+  }
+
+  // Budget check, not a latency model. `gemmPerSec` is the capacity probe:
+  // how many 32x64x64 verified GEMMs this device finishes per second. The
+  // count below is the MAC volume of one window through every layer, divided
+  // by that unit. It is there to refuse a split that cannot produce a token
+  // in `budgetMs`, before any weight download.
+  function estimateLapMs(spec, T, gemmPerSec) {
+    const unit = 32 * 64 * 64;
+    const C = spec.hidden;
+    const inter = spec.inter || (C * 4);
+    const hd = spec.headDim || Math.floor(C / spec.heads);
+    const q = spec.heads * hd;
+    const kv = (spec.kvHeads || spec.heads) * hd;
+    const macPerLayer = T * C * q + 2 * T * C * kv + T * q * C + 3 * T * C * inter
+      + spec.heads * (T * hd * T + T * T * hd);
+    const gemms = (macPerLayer * spec.layers) / unit;
+    return gemms / Math.max(gemmPerSec, 1e-6) * 1000;
+  }
+
+  // Whole-model f32 bytes versus a fraction of reported device RAM.
+  // `deviceGB` comes from navigator.deviceMemory when the browser provides it.
+  // Unknown memory returns false: the ring is used, rather than guessing.
+  function headCanHold(spec, tensors, deviceGB) {
+    if (!deviceGB || deviceGB <= 0) return false;
+    let bytes = 0;
+    for (const t of tensors.values()) bytes += t.elems * 4;
+    return bytes < deviceGB * 0.25 * 1073741824;
+  }
+
+  // A short prompt stays on the head when the head can hold every layer.
+  // The ring still exists for prompts that do not fit that rule.
+  function preferLocal(promptTokens, peerCount, fits) {
+    return !!(fits && peerCount > 0 && promptTokens > 0 && promptTokens <= 64);
+  }
+
+  // Rolling FNV blocks over token ids. This is the approximate prefix index:
+  // it records which prefix this chat last ran. The forward pass still
+  // recomputes the window. Per-column value scales depend on every token in
+  // the window, so skipping a matched block would not be bit-identical to the
+  // full pass, and this project does not ship a second answer.
+  function makePrefixIndex(blockSize) {
+    const B = blockSize || 64;
+    const sessions = new Map();
+    function blocks(ids) {
+      const out = [];
+      for (let i = 0; i < ids.length; i += B) {
+        const slice = ids.slice(i, Math.min(ids.length, i + B));
+        out.push(fnv1a(new TextEncoder().encode(slice.join(","))));
+      }
+      return out;
+    }
+    return {
+      blockSize: B,
+      blocks,
+      note(session, ids) { sessions.set(session, blocks(ids)); },
+      matchedBlocks(session, ids) {
+        const prev = sessions.get(session);
+        if (!prev) return 0;
+        const now = blocks(ids);
+        let n = 0;
+        while (n < now.length && n < prev.length && now[n] === prev[n]) n++;
+        return n;
+      },
+    };
+  }
+
+  // In-memory KV spill. When the byte cap is hit, the oldest block is dropped
+  // and the caller recomputes that span. `held` is what remained.
+  function makeKvSpill(maxBytes) {
+    let used = 0;
+    const order = [];
+    const map = new Map();
+    function drop() {
+      const k = order.shift();
+      const old = map.get(k);
+      if (!old) return;
+      map.delete(k);
+      used -= old.byteLength;
+    }
+    return {
+      get used() { return used; },
+      get size() { return map.size; },
+      put(key, bytes) {
+        const n = bytes.byteLength;
+        if (map.has(key)) {
+          used -= map.get(key).byteLength;
+          const i = order.indexOf(key);
+          if (i >= 0) order.splice(i, 1);
+        }
+        while (order.length && used + n > maxBytes) drop();
+        if (n > maxBytes) return false;
+        map.set(key, bytes);
+        order.push(key);
+        used += n;
+        return true;
+      },
+      get(key) { return map.get(key) || null; },
+    };
+  }
+
+  // Prompt chunks for a pipelined prefill. `window` is how many chunks may be
+  // in flight across the ring at once. Decode stays one token, one lap:
+  // the next token is not known until the lap returns.
+  function prefillChunks(nTokens, chunkSize, inFlight) {
+    const size = Math.max(1, chunkSize | 0);
+    const window = Math.max(1, inFlight | 0);
+    const chunks = [];
+    for (let lo = 0; lo < nTokens; lo += size)
+      chunks.push({ index: chunks.length, lo, hi: Math.min(nTokens, lo + size) });
+    return { chunks, window, chunkSize: size };
+  }
+
+  // Prompt-lookup draft: the longest suffix of the token ids that already
+  // occurred earlier, and the tokens that followed it. No second model.
+  // Empty when nothing repeats. The ring then scores that span in one lap.
+  function promptLookupDraft(ids, maxDraft) {
+    const cap = Math.max(0, maxDraft | 0);
+    const n = ids.length;
+    if (cap === 0 || n < 3) return [];
+    let best = [], bestLen = 0;
+    const maxLen = Math.min(n - 1, 8);
+    for (let len = 2; len <= maxLen; len++) {
+      for (let i = 0; i + len < n; i++) {
+        let match = true;
+        for (let j = 0; j < len; j++) if (ids[i + j] !== ids[n - len + j]) { match = false; break; }
+        if (!match) continue;
+        const draft = [];
+        // Tokens after the earlier copy, and before the suffix we just matched.
+        for (let k = 0; k < cap && i + len + k < n - len; k++) draft.push(ids[i + len + k]);
+        if (!draft.length) continue;
+        if (len > bestLen) { best = draft; bestLen = len; }
+      }
+    }
+    return best;
+  }
+
+  // picked[i] proposes draft[i]. picked has one extra entry: the token at the
+  // first position that rejected, which is always kept.
+  function acceptDraft(picked, draft) {
+    const out = [];
+    let i = 0;
+    while (i < draft.length && i < picked.length && picked[i] === draft[i]) out.push(draft[i]), i++;
+    if (i < picked.length) out.push(picked[i]);
+    return out;
+  }
+
   const api = { planStages, stageBytes, stageWeights, toKN, transposeEmb,
-                fnv1a, hashF32, modelFingerprint };
+                fnv1a, hashF32, modelFingerprint, ringMembers, estimateLapMs,
+                headCanHold, preferLocal, makePrefixIndex, makeKvSpill,
+                prefillChunks, promptLookupDraft, acceptDraft };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.Shard = api;
 })(typeof self !== "undefined" ? self : this);

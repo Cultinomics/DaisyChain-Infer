@@ -106,8 +106,14 @@
   }
 
   // ---- one layer --------------------------------------------------------------
-  async function layerForward(S, x, ly) {
-    const { spec, ctx } = S, C = spec.hidden, T = S.T;
+  // `span` is the chunked-prefill path. Absent, the layer is the verified
+  // full-window GEMM (one scale set for the whole window). Present, this stage
+  // keeps K and V for its own layers and attends the new rows to that cache.
+  // Those two paths are not bit-identical: per-column scales move when the
+  // matrix grows. Callers must not mix them in one comparison.
+  async function layerForward(S, x, ly, span) {
+    const { spec, ctx } = S, C = spec.hidden;
+    const T = span ? (x.length / C) | 0 : S.T;
     const hd = spec.headDim, nH = spec.heads, nKV = spec.kvHeads;
     const qDim = nH * hd, kvDim = nKV * hd;
 
@@ -130,7 +136,14 @@
         vmm(h1, ly.Wv, T, C, kvDim, ctx, ly.bv),
       ]);
     }
-    if (spec.rope) { applyRope(q, T, nH, hd, S.rope, 0); applyRope(k, T, nKV, hd, S.rope, 0); }
+    const pos0 = span ? span.pos0 : 0;
+    if (spec.rope) {
+      const need = pos0 + T + 1;
+      if (!S.rope || S.rope.cos.length < need * (hd >> 1))
+        S.rope = ropeTables(hd, spec.ropeTheta, Math.max(need, spec.maxPos || need));
+      applyRope(q, T, nH, hd, S.rope, pos0);
+      applyRope(k, T, nKV, hd, S.rope, pos0);
+    }
 
     // Grouped-query attention: several query heads share one kv head. Rather
     // than materialising repeated kv (memory this project does not have to
@@ -138,6 +151,18 @@
     const group = nH / nKV;
     const scale = 1 / Math.sqrt(hd);
     const ctxOut = new Float32Array(T * qDim);
+    let cache = null, n0 = 0, N = T;
+    if (span) {
+      if (!span.cache) span.cache = [];
+      cache = span.cache[span.li] || (span.cache[span.li] = { k: null, v: null, n: 0 });
+      n0 = cache.n;
+      N = n0 + T;
+      const nk = new Float32Array(N * kvDim), nv = new Float32Array(N * kvDim);
+      if (cache.k) { nk.set(cache.k); nv.set(cache.v); }
+      nk.set(k, n0 * kvDim); nv.set(v, n0 * kvDim);
+      cache.k = nk; cache.v = nv; cache.n = N;
+      k = nk; v = nv;
+    }
     // Scores and context are the two attention GEMMs. They are small per head
     // (T x hd and T x T), and the fused kernels in webgpu.js expect the
     // trainer's uniform-head layout, so at general head geometry they are run
@@ -145,23 +170,25 @@
     // through the units, and the CPU mirror and GPU kernel agree bit-for-bit.
     for (let h = 0; h < nH; h++) {
       const kvh = Math.floor(h / group);
-      const qh = new Float32Array(T * hd), kh = new Float32Array(T * hd), vh = new Float32Array(T * hd);
-      for (let t = 0; t < T; t++) {
+      const qh = new Float32Array(T * hd), kh = new Float32Array(N * hd), vh = new Float32Array(N * hd);
+      for (let t = 0; t < T; t++)
         qh.set(q.subarray(t * qDim + h * hd, t * qDim + h * hd + hd), t * hd);
+      for (let t = 0; t < N; t++) {
         kh.set(k.subarray(t * kvDim + kvh * hd, t * kvDim + kvh * hd + hd), t * hd);
         vh.set(v.subarray(t * kvDim + kvh * hd, t * kvDim + kvh * hd + hd), t * hd);
       }
-      const khT = TC.transpose(kh, T, hd);                       // hd x T
-      const scores = await V.vgemmBlock(qh, khT, { m: T, k: hd, n: T, batch: 1 }, ctx.L, ctx.bgemm, ctx.audit);
-      const a = new Float32Array(T * T);                          // causal softmax
+      const khT = TC.transpose(kh, N, hd);                       // hd x N
+      const scores = await V.vgemmBlock(qh, khT, { m: T, k: hd, n: N, batch: 1 }, ctx.L, ctx.bgemm, ctx.audit);
+      const a = new Float32Array(T * N);                          // causal softmax
       for (let i = 0; i < T; i++) {
+        const see = n0 + i;                                       // this query's own position in the cache
         let mx = -Infinity;
-        for (let j = 0; j <= i; j++) mx = Math.max(mx, scores[i * T + j] * scale);
+        for (let j = 0; j <= see; j++) mx = Math.max(mx, scores[i * N + j] * scale);
         let z = 0;
-        for (let j = 0; j <= i; j++) { const e = Math.exp(scores[i * T + j] * scale - mx); a[i * T + j] = e; z += e; }
-        for (let j = 0; j <= i; j++) a[i * T + j] /= z;
+        for (let j = 0; j <= see; j++) { const e = Math.exp(scores[i * N + j] * scale - mx); a[i * N + j] = e; z += e; }
+        for (let j = 0; j <= see; j++) a[i * N + j] /= z;
       }
-      const oh = await V.vgemmBlock(a, vh, { m: T, k: T, n: hd, batch: 1 }, ctx.L, ctx.bgemm, ctx.audit);
+      const oh = await V.vgemmBlock(a, vh, { m: T, k: N, n: hd, batch: 1 }, ctx.L, ctx.bgemm, ctx.audit);
       for (let t = 0; t < T; t++) ctxOut.set(oh.subarray(t * hd, t * hd + hd), t * qDim + h * hd);
     }
     const attn = await vmm(ctxOut, ly.Wo, T, qDim, C, ctx, ly.bo);
@@ -210,7 +237,42 @@
   }
 
   async function runLayers(S, x) {
+    // A non-finite activation used to quantize to a silent zero and keep
+    // travelling. Train refuses it (NonFiniteError). A hop must too: the
+    // next stage would otherwise agree on a wrong sum.
+    V.assertFinite(x, "activation");
     for (const ly of S.w.layers) x = await layerForward(S, x, ly);
+    V.assertFinite(x, "activation");
+    return x;
+  }
+
+  // One chunk of a pipelined prefill. `span.cache` is owned by the caller and
+  // lives for the whole prompt; each call appends this chunk's K and V.
+  // `span.pos0` is the first absolute position in `x`.
+  async function runLayersChunk(S, x, span) {
+    V.assertFinite(x, "activation");
+    const C = S.spec.hidden;
+    const T = (x.length / C) | 0;
+    if (T < 1 || T * C !== x.length) throw new Error("chunk length is not a whole number of rows");
+    for (let li = 0; li < S.w.layers.length; li++) {
+      span.li = li;
+      x = await layerForward(S, x, S.w.layers[li], span);
+    }
+    V.assertFinite(x, "activation");
+    return x;
+  }
+
+  function embedRows(S, ids, pos0) {
+    const { spec } = S, C = spec.hidden, T = ids.length;
+    const x = new Float32Array(T * C);
+    for (let i = 0; i < T; i++) {
+      const id = ids[i];
+      for (let j = 0; j < C; j++) x[i * C + j] = S.w.emb[id * C + j];
+      if (S.w.pos) {
+        const p = pos0 + i;
+        for (let j = 0; j < C; j++) x[i * C + j] += S.w.pos[p * C + j];
+      }
+    }
     return x;
   }
 
@@ -222,6 +284,65 @@
     const y = norm(spec, x, T, C, S.w.nrmF, S.w.nrmFb);
     const last = y.subarray((T - 1) * C, T * C);
     return vmm(last, S.w.lmHead, 1, C, spec.vocab, ctx, null);
+  }
+
+  // Logits at several rows of one window, so one lap can score a draft span.
+  // Row indexes are into the fixed context window the verified path uses.
+  async function logitsAt(S, x, rows) {
+    const { spec, ctx } = S, C = spec.hidden;
+    const T = (x.length / C) | 0;
+    const y = norm(spec, x, T, C, S.w.nrmF, S.w.nrmFb);
+    const out = [];
+    for (const r of rows) {
+      if (r < 0 || r >= T) throw new Error("readout row outside the window");
+      out.push(await vmm(y.subarray(r * C, (r + 1) * C), S.w.lmHead, 1, C, spec.vocab, ctx, null));
+    }
+    return out;
+  }
+
+  // Chunked prefill, then one new token per lap on the same KV. Both the
+  // ring and the differential check call this so they compare like with like.
+  // It is not the full-window path.
+  async function generateChunked(stages, ids0, nNew, chunkSize, opts) {
+    const ids = [...ids0];
+    const spans = stages.map(() => ({ cache: [], pos0: 0, li: 0 }));
+    const size = Math.max(1, chunkSize | 0);
+    let last = null;
+    for (let lo = 0; lo < ids.length; lo += size) {
+      const piece = ids.slice(lo, Math.min(ids.length, lo + size));
+      let x = embedRows(stages[0], piece, lo);
+      for (let s = 0; s < stages.length; s++) {
+        spans[s].pos0 = lo;
+        x = await runLayersChunk(stages[s], x, spans[s]);
+      }
+      last = x;
+    }
+    for (let n = 0; n < nNew; n++) {
+      const row = (last.length / stages[0].spec.hidden) - 1;
+      const id = pickToken((await logitsAt(stages[0], last, [row]))[0], opts);
+      ids.push(id);
+      const pos = ids.length - 1;
+      let x = embedRows(stages[0], [id], pos);
+      for (let s = 0; s < stages.length; s++) {
+        spans[s].pos0 = pos;
+        x = await runLayersChunk(stages[s], x, spans[s]);
+      }
+      last = x;
+    }
+    return ids;
+  }
+
+  // Where, in a left-padded window of length T, the logits sit that propose
+  // each draft token plus the one token after the first rejection.
+  function draftRows(T, seqLen, draftLen) {
+    const rows = [];
+    const first = seqLen - draftLen - 1;
+    for (let i = 0; i <= draftLen; i++) {
+      const tok = first + i;
+      if (tok < 0 || tok >= seqLen) break;
+      rows.push(T - seqLen + tok);
+    }
+    return rows;
   }
 
   // ---- sampling ---------------------------------------------------------------
@@ -259,7 +380,40 @@
     return out;
   }
 
-  const api = { makeStage, embed, runLayers, readout, pickToken, generateLocal,
+  // Verified full-window path, with a prompt-lookup draft scored in the same lap.
+  // An empty draft is exactly one new token, the same window as generateLocal.
+  async function generateLookahead(stages, ids0, nNew, T, opts) {
+    const ids = [...ids0];
+    const head = stages[0];
+    const maxDraft = opts && opts.maxDraft != null ? opts.maxDraft : 4;
+    let produced = 0;
+    while (produced < nNew) {
+      let draft = SH.promptLookupDraft(ids, maxDraft);
+      const seqIds = ids.concat(draft);
+      const shown = seqIds.slice(-T);
+      const shownDraft = Math.min(draft.length, Math.max(0, shown.length - 1));
+      draft = draft.slice(draft.length - shownDraft);
+      const win = new Int32Array(T);
+      for (let i = 0; i < shown.length; i++) win[T - shown.length + i] = shown[i];
+      let x = embed(head, win);
+      for (const S of stages) x = await runLayers(S, x);
+      const rows = draftRows(T, shown.length, draft.length);
+      const picked = [];
+      for (const logits of await logitsAt(head, x, rows)) picked.push(pickToken(logits, opts));
+      const got = SH.acceptDraft(picked, draft);
+      if (!got.length) break;
+      for (const id of got) {
+        ids.push(id);
+        produced++;
+        if (produced >= nNew) break;
+      }
+    }
+    return ids;
+  }
+
+  const api = { makeStage, embed, embedRows, runLayers, runLayersChunk, readout, logitsAt, draftRows,
+                generateLookahead,
+                pickToken, generateLocal, generateChunked,
                 rmsNorm, layerNorm, norm, ropeTables, applyRope, silu, gelu, mulberry32 };
   if (typeof module !== "undefined" && module.exports) {
     TC = require("./traincore.js"); V = require("./verified_core.js"); SH = require("./shard.js");

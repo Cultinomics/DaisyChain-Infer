@@ -54,12 +54,28 @@
   // ORDER MATTERS: float addition is not associative, so every replica MUST
   // pass the gradients in the same order (the leader's roster order) or their
   // averages differ in the last bits and the weights fork. Never self-first.
+  //
+  // REFUSES (throws GradientError) rather than averaging when (a) the gradients differ in
+  // length -- typed arrays silently ignore out-of-range writes, so a truncated gradient used
+  // to be averaged over a prefix with no error -- or (b) any value is non-finite: one NaN
+  // would enter DaisyAdam's m/v on EVERY peer (and every later checkpoint) identically, so no
+  // fork check could see it. Refusing BEFORE the optimizer keeps weights and moments clean.
   function averageGrads(grads) {
-    const out = new Float32Array(grads[0].length);
+    const len = grads[0].length;
+    for (let r = 0; r < grads.length; r++) {
+      const g = grads[r];
+      if (!g || g.length !== len) throw gradError("gradient " + r + " has " +
+        (g ? g.length : "no") + " values, gradient 0 has " + len);
+      for (let i = 0; i < len; i++) if (!Number.isFinite(g[i]))
+        throw gradError("gradient " + r + " is non-finite at index " + i + " (" + g[i] + ")");
+    }
+    const out = new Float32Array(len);
     for (const g of grads) for (let i = 0; i < g.length; i++) out[i] += g[i];
     for (let i = 0; i < out.length; i++) out[i] /= grads.length;
     return out;
   }
+
+  function gradError(msg) { const e = new Error(msg); e.name = "GradientError"; return e; }
 
   // DaisyAdam — Adam with bias correction, applied to the cluster-averaged
   // gradient. State is a pure function of the gradient sequence, so every peer

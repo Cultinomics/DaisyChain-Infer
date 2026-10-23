@@ -125,17 +125,27 @@
     }
     let done = 0;
     const total = tensors.reduce((a, t) => a + t.bytes, 0);
-    for (const [file, list] of byFile) {
-      for (const run of ST.coalesce(list)) {
-        const buf = await getRange(repo, file, revision, token, run.start, run.end);
-        for (const t of run.tensors) {
-          const off = t.start - run.start;
-          out.set(t.name, ST.toF32(t.dtype, new Uint8Array(buf, off, t.bytes)));
-          done += t.bytes;
-          if (onProgress) onProgress(`${(done / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`);
-        }
+    // One range stays in flight while the previous body is widened to f32.
+    // The bytes are unchanged. The next layer's read hides behind this one.
+    const runs = [];
+    for (const [file, list] of byFile)
+      for (const run of ST.coalesce(list)) runs.push({ file, run });
+    let pending = null;
+    const take = async (slot) => {
+      const buf = await slot.p;
+      for (const t of slot.run.tensors) {
+        const off = t.start - slot.run.start;
+        out.set(t.name, ST.toF32(t.dtype, new Uint8Array(buf, off, t.bytes)));
+        done += t.bytes;
+        if (onProgress) onProgress(`${(done / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`);
       }
+    };
+    for (const slot of runs) {
+      const p = getRange(repo, slot.file, revision, token, slot.run.start, slot.run.end);
+      if (pending) await take(pending);
+      pending = { p, run: slot.run };
     }
+    if (pending) await take(pending);
     return out;
   }
 

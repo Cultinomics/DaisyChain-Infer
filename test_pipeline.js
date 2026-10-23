@@ -188,6 +188,87 @@ const GPT2 = Arch.fromConfig({
     assert.ok(a[0].head, "stage 0 must be the head");
   });
 
+  await t("a disagreeing kernel probe is left out of the ring", async () => {
+    const caps = [
+      { id: "head", capacity: 100, probe: 1 },
+      { id: "ok", capacity: 100, probe: 1 },
+      { id: "bad", capacity: 900, probe: 2 },
+    ];
+    const members = Shard.ringMembers(caps, 1);
+    assert.deepStrictEqual(members.map(d => d.id), ["head", "ok"]);
+    const plan = Shard.planStages(LLAMA, members);
+    assert.ok(plan.every(s => s.id !== "bad"));
+    assert.strictEqual(plan.reduce((s, x) => s + (x.hi - x.lo), 0), LLAMA.layers);
+  });
+
+  await t("lap estimate grows with context and refuses an idle device", async () => {
+    const spec = Object.assign({}, LLAMA, { inter: 64, headDim: 8 });
+    const slow = Shard.estimateLapMs(spec, 128, 0.01);
+    const fast = Shard.estimateLapMs(spec, 8, 1000);
+    assert.ok(slow > fast, "a longer window on a slower device must cost more");
+    assert.ok(fast > 0);
+  });
+
+  await t("a short prompt stays local only when the head can hold the model", async () => {
+    const tensors = new Map([["w", { elems: 1000 }]]);
+    const spec = { hidden: 8 };
+    assert.strictEqual(Shard.headCanHold(spec, tensors, 0), false);
+    assert.strictEqual(Shard.headCanHold(spec, tensors, 8), true);
+    assert.strictEqual(Shard.preferLocal(16, 2, true), true);
+    assert.strictEqual(Shard.preferLocal(128, 2, true), false);
+    assert.strictEqual(Shard.preferLocal(16, 2, false), false);
+    assert.strictEqual(Shard.preferLocal(16, 0, true), false);
+  });
+
+  await t("prefix blocks match a continuation and the spill evicts the oldest block", async () => {
+    const idx = Shard.makePrefixIndex(4);
+    const a = [1, 2, 3, 4, 5, 6, 7, 8];
+    idx.note("chat", a);
+    assert.strictEqual(idx.matchedBlocks("chat", a.concat([9])), 2);
+    assert.strictEqual(idx.matchedBlocks("chat", [9, 9, 9, 9]), 0);
+    const spill = Shard.makeKvSpill(12);
+    assert.strictEqual(spill.put("a", new Uint8Array(8)), true);
+    assert.strictEqual(spill.put("b", new Uint8Array(8)), true);
+    assert.strictEqual(spill.get("a"), null, "the oldest block must be spilled");
+    assert.ok(spill.get("b"));
+    assert.strictEqual(spill.put("huge", new Uint8Array(13)), false);
+  });
+
+  await t("prefill chunks, prompt-lookup drafts, and accept keep a bonus token", async () => {
+    const c = Shard.prefillChunks(40, 16, 2);
+    assert.strictEqual(c.chunks.length, 3);
+    assert.deepStrictEqual([c.chunks[2].lo, c.chunks[2].hi], [32, 40]);
+    assert.strictEqual(c.window, 2);
+    const ids = [1, 2, 3, 9, 1, 2, 3];
+    assert.deepStrictEqual(Shard.promptLookupDraft(ids, 4), [9]);
+    assert.deepStrictEqual(Shard.acceptDraft([9, 4], [9]), [9, 4]);
+    assert.deepStrictEqual(Shard.acceptDraft([8, 4], [9]), [8]);
+  });
+
+  await t("chunked prefill matches across a stage split", async () => {
+    const got = makeWeights(LLAMA);
+    const prompt = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8];
+    const whole = await Infer.generateChunked(stagesFor(LLAMA, got, [LLAMA.layers], 16), prompt, 3, 4, { temperature: 0 });
+    const split = await Infer.generateChunked(stagesFor(LLAMA, got, [2, 2, 2], 16), prompt, 3, 4, { temperature: 0 });
+    assert.deepStrictEqual(split, whole);
+  });
+
+  await t("a lookahead draft scores in one window and survives a split", async () => {
+    const got = makeWeights(LLAMA);
+    const prompt = [4, 4, 4, 7, 4, 4, 4];
+    const opts = { temperature: 0, maxDraft: 4 };
+    const whole = await Infer.generateLookahead(stagesFor(LLAMA, got, [LLAMA.layers], 16), prompt, 4, 16, opts);
+    const split = await Infer.generateLookahead(stagesFor(LLAMA, got, [1, 2, 3], 16), prompt, 4, 16, opts);
+    assert.deepStrictEqual(split, whole);
+    assert.strictEqual(whole.length, prompt.length + 4);
+  });
+
+  await t("a non-finite activation is refused before any layer runs", async () => {
+    const S = { w: { layers: [] }, spec: LLAMA, T: 2 };
+    const bad = new Float32Array([0, 1, NaN, 2]);
+    await assert.rejects(() => Infer.runLayers(S, bad), (e) => e.name === "NonFiniteError");
+  });
+
   console.log(failed ? `\n${failed} failure(s)\n` : "\nall pipeline checks passed\n");
   process.exit(failed ? 1 : 0);
 })();

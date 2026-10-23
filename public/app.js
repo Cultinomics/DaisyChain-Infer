@@ -418,6 +418,7 @@ function setupChannel(peerId, dc) {
   dc.onclose = () => { chans.delete(peerId); updatePeers(); wake(); scheduleReconnect(peerId); };
   dc.onmessage = (e) => onWire(peerId, e.data);
 }
+let peerDropped = false;
 function cleanupPeer(id) {
   clearWatchdog(id);
   const pc = pcs.get(id); if (pc) pc.close();
@@ -425,6 +426,8 @@ function cleanupPeer(id) {
   const dc = chans.get(id);
   if (dc && !dc.isRelay) chans.delete(id);       // keep a working relay channel
   for (const k of fragIn.keys()) if (k.startsWith(id + ":")) fragIn.delete(k);
+  if (running) peerDropped = true;
+  caps.delete(id);
   wake();
 }
 
@@ -555,14 +558,27 @@ async function loadRepo() {
   ui.loadRepo.disabled = false;
 }
 
-function buildPlan() {
-  if (!repoInfo) return null;
-  const list = [{ id: myId, capacity: myCapacity, backend: compute.backend }];
+const prefixIndex = Shard.makePrefixIndex(64);
+const kvSpill = Shard.makeKvSpill(32 * 1048576);
+const CHAT = "chat";
+const LAP_BUDGET_MS = 120000;
+
+function memberList() {
+  const list = [{ id: myId, capacity: myCapacity, backend: compute.backend, probe: probeHash }];
   for (const id of [...chans.keys()].sort((a, b) => +a.slice(1) - +b.slice(1))) {
     const c = caps.get(id);
-    if (c) list.push({ id, capacity: c.capacity, backend: c.backend });
+    if (!c) continue;
+    if (probeHash && c.probe && c.probe !== probeHash) {
+      log(`${nmeOf(id)} stays out of the plan: kernel probe ${c.probe} != ${probeHash}.`);
+      continue;
+    }
+    list.push({ id, capacity: c.capacity, backend: c.backend, probe: c.probe });
   }
-  return Shard.planStages(repoInfo.spec, list);
+  return list;
+}
+function buildPlan() {
+  if (!repoInfo) return null;
+  return Shard.planStages(repoInfo.spec, Shard.ringMembers(memberList(), probeHash));
 }
 function renderPlan() {
   if (!plan) {
@@ -676,10 +692,49 @@ async function onAct(peerId, buf) {
   const kind = Wire.classifyAct(nextIndex, me ? me.index : -99);
   if (kind === "return") { actIn.set(`${seq}:${tokenIdx}`, hidden); wake(); return; }
   if (kind === "other" || !me || !stageObj) return;
+  const rows = hidden.length / spec.hidden;
+  const chunked = Number.isInteger(rows) && rows !== stageObj.T;
+  if (chunked) {
+    if (!stageObj.inbox || stageObj.boxSeq !== seq) {
+      stageObj.inbox = new Map();
+      stageObj.boxSeq = seq;
+      stageObj.nextChunk = 0;
+      stageObj.posChunk = 0;
+      stageObj.span = { cache: [], pos0: 0, li: 0 };
+    }
+    stageObj.inbox.set(tokenIdx, hidden);
+    while (stageObj.inbox.has(stageObj.nextChunk)) {
+      const h = stageObj.inbox.get(stageObj.nextChunk);
+      stageObj.inbox.delete(stageObj.nextChunk);
+      const t0 = performance.now();
+      let x;
+      try {
+        stageObj.span.pos0 = stageObj.posChunk;
+        x = await Infer.runLayersChunk(stageObj, h, stageObj.span);
+      } catch (e) {
+        log(e.name === "NonFiniteError"
+          ? `REFUSED activation from ${nmeOf(peerId)}: ${e.message}. A non-finite hop is not forwarded.`
+          : `stage failed: ${redact(e.message)}`);
+        return;
+      }
+      if (auditFailure) { log("KERNEL AUDIT FAILED mid-hop — refusing to pass on a value I cannot vouch for"); return; }
+      stageObj.posChunk += h.length / spec.hidden;
+      stageObj.nextChunk++;
+      const hop = Wire.routeAfter(plan, me.index);
+      ui.ringState.textContent = `chunk ${stageObj.nextChunk - 1} in ${(performance.now() - t0).toFixed(0)} ms`;
+      await sendTo(hop.to, packAct(seq, stageObj.nextChunk - 1, hop.address, x));
+    }
+    return;
+  }
   const t0 = performance.now();
   let x;
   try { x = await Infer.runLayers(stageObj, hidden); }
-  catch (e) { log(`stage failed: ${redact(e.message)}`); return; }
+  catch (e) {
+    log(e.name === "NonFiniteError"
+      ? `REFUSED activation from ${nmeOf(peerId)}: ${e.message}. A non-finite hop is not forwarded.`
+      : `stage failed: ${redact(e.message)}`);
+    return;
+  }
   if (auditFailure) { log("KERNEL AUDIT FAILED mid-hop — refusing to pass on a value I cannot vouch for"); return; }
   const hop = Wire.routeAfter(plan, me.index);
   ui.ringState.textContent = `layers ${me.lo}–${me.hi - 1} in ${(performance.now() - t0).toFixed(0)} ms → ` +
@@ -687,8 +742,15 @@ async function onAct(peerId, buf) {
   await sendTo(hop.to, packAct(seq, tokenIdx, hop.address, x));
 }
 
-async function generate() {
-  if (running) return;
+const promptQueue = [];
+
+async function generate(isReplay) {
+  if (running) {
+    const waiting = (ui.prompt.value || "").slice(0, 80);
+    promptQueue.push(ui.prompt.value);
+    log(`ring busy — queued (${promptQueue.length} waiting): "${waiting}". The turn already generating keeps the ring.`);
+    return;
+  }
   if (!repoInfo) { log("load a model first — the device that loads it drives the ring"); return; }
   if (!tok) { log("no tokenizer loaded"); return; }
   running = true; abortRun = false; auditFailure = null;
@@ -698,6 +760,28 @@ async function generate() {
     const T = Math.min(ctxLen(), repoInfo.spec.maxPos);
     plan = buildPlan(); modelHash = repoInfo.fingerprint; spec = repoInfo.spec;
     renderPlan();
+    const promptText = ui.prompt.value || "The";
+    let idsPreview = [...Tokenizer.encode(tok, promptText)];
+    if (!idsPreview.length) idsPreview = [0];
+    const lapMs = Shard.estimateLapMs(spec, T, myCapacity);
+    log(`lap estimate ${Math.round(lapMs)} ms/token on this device's capacity (budget ${LAP_BUDGET_MS} ms).`);
+    if (lapMs > LAP_BUDGET_MS) {
+      throw new Error(`refusing the run: estimated ${Math.round(lapMs)} ms per token exceeds ${LAP_BUDGET_MS} ms. ` +
+                      `Add a faster device or lower the context length.`);
+    }
+    const fits = Shard.headCanHold(spec, repoInfo.tensors, navigator.deviceMemory || 0);
+    const local = Shard.preferLocal(idsPreview.length, plan.length - 1, fits);
+    const matched = prefixIndex.matchedBlocks(CHAT, idsPreview);
+    if (matched) {
+      log(`prefix index: ${matched} block(s) of 64 tokens match this chat. ` +
+          `The window is still recomputed so the token ids stay bit-identical to a full pass.`);
+    }
+    if (local) {
+      log(`short prompt (${idsPreview.length} tokens) fits on this device ` +
+          `(${(navigator.deviceMemory)} GB reported). Running here. The ring is not used for this turn.`);
+      plan = [{ id: myId, index: 0, lo: 0, hi: spec.layers, head: true, capacity: myCapacity, backend: compute.backend }];
+      renderPlan();
+    }
     if (plan.length > 1) {
       log(`plan: ${spec.layers} layers over ${plan.length} device(s) — ` +
           plan.map(s => `${s.id === myId ? "me" : nmeOf(s.id)}:${s.hi - s.lo}`).join(", "));
@@ -719,36 +803,109 @@ async function generate() {
     const seq = ++runSeq;
     const nTok = +ui.ntok.value, temp = +ui.temp.value / 100;
     const opts = { temperature: temp, topK: 40, rng: Infer.mulberry32(+ui.seed.value | 0) };
-    let ids = [...Tokenizer.encode(tok, ui.prompt.value || "The")];
-    if (!ids.length) ids = [0];
+    let ids = idsPreview.slice();
+    prefixIndex.note(CHAT, ids);
+    // The bytes kept here are the prefix-block hashes, not layer KV. Reusing
+    // K and V would change per-column int8 scales, so the pass still recomputes.
+    const hashBytes = new Uint8Array(new Uint32Array(prefixIndex.blocks(ids)).buffer);
+    if (!kvSpill.put(CHAT, hashBytes)) log("prefix record is larger than the spill cap; this chat is not retained.");
+    if (typeof indexedDB !== "undefined") {
+      const open = indexedDB.open("daisychain-infer", 1);
+      open.onupgradeneeded = () => open.result.createObjectStore("prefix");
+      open.onsuccess = () => {
+        const db = open.result;
+        db.transaction("prefix", "readwrite").objectStore("prefix").put(hashBytes, CHAT);
+      };
+    }
     const promptLen = ids.length;
     ui.out.textContent = ui.prompt.value;
     const tStart = performance.now();
     let hops = 0;
 
-    for (let n = 0; n < nTok && !abortRun; n++) {
+    const useChunks = plan.length > 1 && ids.length > 32;
+    let chunkedIds = null;
+    if (useChunks) {
+      log(`overlap prefill: ${ids.length} prompt tokens, chunks of 16, 2 in flight. ` +
+          `Each stage keeps KV for its own layers. This is not the full-window GEMM.`);
+      const chunks = Shard.prefillChunks(ids.length, 16, 2);
+      const span = { cache: [], pos0: 0, li: 0 };
+      const hop = async (index, hidden) => {
+        await sendTo(plan[1].id, packAct(seq, index, plan[1].index, hidden));
+        hops += plan.length;
+        const key = `${seq}:${index}`;
+        const ok = await waitFor(() => actIn.has(key) || peerDropped, 60000);
+        if (peerDropped) throw new Error("peer dropped");
+        if (!ok) throw new Error("stalled");
+        const h = actIn.get(key); actIn.delete(key);
+        return h;
+      };
+      const flights = [];
+      let last = null;
+      let nextIdx = 0;
+      for (const ch of chunks.chunks) {
+        if (abortRun) break;
+        const piece = ids.slice(ch.lo, ch.hi);
+        let x = Infer.embedRows(stageObj, piece, ch.lo);
+        span.pos0 = ch.lo;
+        x = await Infer.runLayersChunk(stageObj, x, span);
+        if (auditFailure) throw new Error("kernel audit failed");
+        flights.push(hop(nextIdx++, x));
+        if (flights.length >= chunks.window) last = await flights.shift();
+      }
+      while (flights.length) last = await flights.shift();
+      let produced = 0;
+      while (produced < nTok && !abortRun && last) {
+        const row = (last.length / spec.hidden) - 1;
+        const id = Infer.pickToken((await Infer.logitsAt(stageObj, last, [row]))[0], opts);
+        ids.push(id); produced++;
+        ui.out.textContent = Tokenizer.decode(tok, ids);
+        ui.tokcount.textContent = String(produced);
+        broadcast(Wire.packToken(seq, id, ids.length));
+        const pos = ids.length - 1;
+        let x = Infer.embedRows(stageObj, [id], pos);
+        span.pos0 = pos;
+        x = await Infer.runLayersChunk(stageObj, x, span);
+        last = await hop(nextIdx++, x);
+      }
+      chunkedIds = ids.slice();
+    }
+
+    if (!useChunks) {
+    for (let produced = 0; produced < nTok && !abortRun; ) {
+      let draft = Shard.promptLookupDraft(ids, 4);
+      const seqIds = ids.concat(draft);
+      const shown = seqIds.slice(-T);
+      const shownDraft = Math.min(draft.length, Math.max(0, shown.length - 1));
+      draft = draft.slice(draft.length - shownDraft);
       const win = new Int32Array(T);
-      const tail = ids.slice(-T);
-      for (let i = 0; i < tail.length; i++) win[T - tail.length + i] = tail[i];
+      for (let i = 0; i < shown.length; i++) win[T - shown.length + i] = shown[i];
       let x = Infer.embed(stageObj, win);
       x = await Infer.runLayers(stageObj, x);
       if (auditFailure) { log(`KERNEL AUDIT FAILED: ${auditFailure} — stopping`); break; }
       if (plan.length > 1) {
-        await sendTo(plan[1].id, packAct(seq, n, plan[1].index, x));
+        await sendTo(plan[1].id, packAct(seq, produced, plan[1].index, x));
         hops += plan.length;
-        const key = `${seq}:${n}`;
-        const ok = await waitFor(() => actIn.has(key), 60000);
-        if (!ok) { log(`the ring stalled at token ${n + 1}: no activation came back. Press Generate again to re-plan.`); break; }
+        const key = `${seq}:${produced}`;
+        const ok = await waitFor(() => actIn.has(key) || peerDropped, 60000);
+        if (peerDropped) throw new Error("peer dropped");
+        if (!ok) throw new Error("stalled");
         x = actIn.get(key); actIn.delete(key);
       }
-      const id = Infer.pickToken(await Infer.readout(stageObj, x), opts);
-      ids.push(id);
-      ui.out.textContent = Tokenizer.decode(tok, ids);
-      ui.tokcount.textContent = String(n + 1);
-      ui.hops.textContent = String(hops);
-      ui.tps.textContent = ((n + 1) / ((performance.now() - tStart) / 1000)).toFixed(2);
-      broadcast(Wire.packToken(seq, id, ids.length));
+      const rows = Infer.draftRows(T, shown.length, draft.length);
+      const picked = (await Infer.logitsAt(stageObj, x, rows)).map(l => Infer.pickToken(l, opts));
+      const got = Shard.acceptDraft(picked, draft);
+      if (draft.length) log(`draft span ${draft.length}, accepted ${Math.max(0, got.length - 1)} before the bonus token. One lap.`);
+      for (const id of got) {
+        if (produced >= nTok) break;
+        ids.push(id); produced++;
+        ui.out.textContent = Tokenizer.decode(tok, ids);
+        ui.tokcount.textContent = String(produced);
+        ui.hops.textContent = String(hops);
+        ui.tps.textContent = ((produced) / ((performance.now() - tStart) / 1000)).toFixed(2);
+        broadcast(Wire.packToken(seq, id, ids.length));
+      }
       await new Promise(r => setTimeout(r, 0));
+    }
     }
     // The differential check. In a pipeline nothing recomputes anything, so
     // this is the only instrument that can show a distributed answer is RIGHT
@@ -759,8 +916,12 @@ async function generate() {
       log("verifying: fetching the whole model here and re-running the same prompt…");
       const all = { id: myId, index: 0, lo: 0, hi: spec.layers, head: true };
       const solo = await loadMyStage({ repo: repoInfo.repo, revision: repoInfo.revision, spec, ctx: T }, all);
-      const ref = await Infer.generateLocal([solo], Tokenizer.encode(tok, ui.prompt.value || "The"), nTok,
-                                            { temperature: temp, topK: 40, rng: Infer.mulberry32(+ui.seed.value | 0) });
+      const promptIds = Tokenizer.encode(tok, ui.prompt.value || "The");
+      const ref = useChunks
+        ? await Infer.generateChunked([solo], promptIds.length ? promptIds : [0], nTok, 16,
+                                      { temperature: temp, topK: 40, rng: Infer.mulberry32(+ui.seed.value | 0) })
+        : await Infer.generateLookahead([solo], promptIds.length ? promptIds : [0], nTok, T,
+                                      { temperature: temp, topK: 40, rng: Infer.mulberry32(+ui.seed.value | 0), maxDraft: 4 });
       const same = ref.length === ids.length && ref.every((v, i) => v === ids[i]);
       log(same ? "VERIFIED: the distributed run and the single-device run produced identical token ids."
                : `MISMATCH: the ring and this device disagree. Distributed "${Tokenizer.decode(tok, ids).slice(0, 60)}" ` +
@@ -770,12 +931,25 @@ async function generate() {
                        `over ${plan.length} stage(s)`);
     broadcast(Wire.packDone(seq));
   } catch (e) {
+    if (!isReplay && /peer dropped|stalled/.test(String(e.message))) {
+      log("a peer left the ring. Replanning the remaining devices and replaying the prompt from the start.");
+      peerDropped = false;
+      running = false;
+      ui.genBtn.disabled = false; ui.stopBtn.disabled = true;
+      ui.ringState.textContent = "idle";
+      return generate(true);
+    }
     log(`run failed: ${redact(e.message)}`);
     console.error(e);
   }
   running = false;
   ui.genBtn.disabled = false; ui.stopBtn.disabled = true;
   ui.ringState.textContent = "idle";
+  if (promptQueue.length && !abortRun) {
+    ui.prompt.value = promptQueue.shift();
+    log(`starting queued prompt (${promptQueue.length} still waiting).`);
+    generate();
+  }
 }
 
 function onToken(peerId, buf) {

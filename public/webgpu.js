@@ -286,7 +286,11 @@
                   matmulInt8: (Xq, Wq, m, k, n, LL) => root.Verified.lutMatmulJS(Xq, Wq, m, k, n, LL) };
     if (!(root.navigator && navigator.gpu)) return cpu;
     try {
-      const adapter = await navigator.gpu.requestAdapter();
+      // Ask for the discrete GPU: the default adapter on a laptop is the iGPU
+      // (measured 2026-10-14: Intel gen-9 picked while an RTX sat idle). The
+      // browser may still hand back the iGPU; the gates decide what runs.
+      const adapter = (await navigator.gpu.requestAdapter({ powerPreference: "high-performance" })) ||
+                      (await navigator.gpu.requestAdapter());
       if (!adapter) return cpu;
       const device = await adapter.requestDevice();
       const info = adapter.info || {};
@@ -330,9 +334,27 @@
       // because head-strided addressing is where these kernels can go wrong.
       let att = { scores: (qq, kq, qs, ks, d) => gpuAttScores(device, d.acc ? scoresVPipe : scoresPipe, qq, kq, qs, ks, d),
                   ctx: (aq, vq, as, vs, d) => gpuAttCtx(device, d.acc ? ctxVPipe : ctxPipe, aq, vq, as, vs, d) };
+      // Two sweeps: the second runs on RECYCLED pool buffers left full of
+      // large-magnitude residue (same shapes => same buckets, LIFO free list),
+      // the dirty-buffer gate the bgemm and MLP kernels already had. Without it
+      // a kernel that skips writing some output cell would pass on fresh
+      // buffers and corrupt live steps (2026-10-14 review).
+      const ATT_SHAPES = [{ B: 2, T: 8, heads: 2, hd: 8 }, { B: 1, T: 32, heads: 2, hd: 16 },
+                          { B: 3, T: 7, heads: 3, hd: 5 }, { B: 2, T: 33, heads: 4, hd: 8 }];
       try {
-        for (const d0 of [{ B: 2, T: 8, heads: 2, hd: 8 }, { B: 1, T: 32, heads: 2, hd: 16 },
-                          { B: 3, T: 7, heads: 3, hd: 5 }, { B: 2, T: 33, heads: 4, hd: 8 }]) {
+        for (const dirty of [false, true]) {
+          if (dirty) for (const d0 of ATT_SHAPES) {
+            const nQ = d0.B * d0.T * d0.heads * d0.hd, nA = d0.B * d0.heads * d0.T * d0.T;
+            const big = (n) => new Float32Array(n).fill(1e4);
+            for (const acc of [false, true]) {
+              const dv = { ...d0, acc };
+              await att.scores(new Int8Array(nQ).fill(127), new Int8Array(nQ).fill(127),
+                               big(d0.B * d0.T * d0.heads), big(d0.B * d0.T * d0.heads), dv);
+              await att.ctx(new Int8Array(nA).fill(127), new Int8Array(nQ).fill(127),
+                            big(d0.B * d0.heads * d0.T), big(d0.B * d0.heads * d0.hd), dv);
+            }
+          }
+        for (const d0 of ATT_SHAPES) {
           const nQ = d0.B * d0.T * d0.heads * d0.hd;
           const qq = new Int8Array(nQ), kq = new Int8Array(nQ), vq = new Int8Array(nQ);
           for (let i = 0; i < nQ; i++) { qq[i] = (Math.random() * 256 - 128) | 0; kq[i] = (Math.random() * 256 - 128) | 0; vq[i] = (Math.random() * 256 - 128) | 0; }
@@ -353,7 +375,8 @@
           const refS = root.Verified.attScoresJS(qq, kq, qs, ks, d0, L);
           const refC = root.Verified.attCtxJS(aq, vq, as, vs, d0, L);
           for (let i = 0; i < refS.length; i++) if (bitDiff(hwS[i], refS[i])) throw new Error(`scores epilogue mismatch @${i}`);
-          for (let i = 0; i < refC.length; i++) if (bitDiff(hwC[i], refC[i])) throw new Error(`ctx epilogue mismatch @${i}`);
+          for (let i = 0; i < refC.length; i++) if (bitDiff(hwC[i], refC[i])) throw new Error(`ctx epilogue mismatch @${i}${dirty ? " (dirty pool)" : ""}`);
+        }
         }
       } catch (e) {
         console.warn("fused attention kernels failed verification — using CPU LUT mirrors:", e.message);
@@ -398,6 +421,39 @@
         const Bt = Float32Array.from({ length: mT * nT }, () => Math.random() - 0.5);
         const Bn = Float32Array.from({ length: kT * nT }, () => Math.random() - 0.5);
         const dT = { m: kT, k: mT, n: nT, transA: true }, dN = { m: mT, k: kT, n: nT };
+        // transA against the MIRROR, not just against fgemm: before 2026-10-14
+        // the transA index pattern was only ever compared with itself (fgemm2
+        // leg vs fgemm call, same shader), so a wrong A[p*m+row] passed. The
+        // second shape puts transA through split-K (k > 4096) as well.
+        const fma = fgemmFma;
+        for (const [mA, kA, nA] of [[kT, mT, nT], [6, 4500, 3]]) {
+          const At = Float32Array.from({ length: mA * kA }, () => Math.random() - 0.5);
+          const Bx = Float32Array.from({ length: kA * nA }, () => Math.random() - 0.5);
+          const dX = { m: mA, k: kA, n: nA, transA: true };
+          const got = await fgemm(At, Bx, dX), want = root.Verified.fgemmMirror(At, Bx, dX, fma);
+          for (let i = 0; i < want.length; i++) if (bitDiff(got[i], want[i])) throw new Error(`fgemm transA differs from the mirror @${i} (${mA}x${kA}x${nA})`);
+        }
+        // SUBNORMALS: WGSL permits an implementation to flush f32 subnormals to
+        // zero, and the JS mirror never flushes. The random inputs above are
+        // ~0.1 in magnitude and never produce one, so a flushing GPU passed this
+        // gate and then forked from non-flushing peers on tiny gradients
+        // (2026-10-14; the emulator's FTZ/DAZ lesson). Products here are ~1e-40.
+        {
+          const dS = { m: 3, k: 64, n: 2 };
+          const As = Float32Array.from({ length: dS.m * dS.k }, (_, i) => (i % 2 ? 1 : -1) * (1 + (i % 7)) * 1e-20);
+          const Bs = Float32Array.from({ length: dS.k * dS.n }, (_, i) => (1 + (i % 5)) * 1e-20);
+          const got = await fgemm(As, Bs, dS), want = root.Verified.fgemmMirror(As, Bs, dS, fma);
+          let sub = 0;
+          for (let i = 0; i < want.length; i++) if (want[i] !== 0 && Math.abs(want[i]) < 1.1754943508222875e-38) sub++;
+          if (!sub) throw new Error("subnormal gate case produced no subnormal (test is vacuous)");
+          for (let i = 0; i < want.length; i++) if (bitDiff(got[i], want[i]))
+            throw new Error(`fgemm flushes or rounds subnormals differently @${i}: ${got[i]} vs mirror ${want[i]}`);
+        }
+        // dirty re-gate: poison the partial/output buckets at the gate's shapes, then re-check
+        await fgemm(new Float32Array(m0 * k0).fill(1e4), new Float32Array(k0 * n0).fill(1e4), dG);
+        const hw2 = await fgemm(A, Bm, dG);
+        const mRef = fma ? mFma : mStep;
+        for (let i = 0; i < hw2.length; i++) if (bitDiff(hw2[i], mRef[i])) throw new Error(`fgemm differs on a recycled (dirty) pool @${i}`);
         const [f1, f2] = await fgemm2(A2, Bt, dT, Bn, dN);
         const [r1, r2] = [await fgemm(A2, Bt, dT), await fgemm(A2, Bn, dN)];
         for (let i = 0; i < r1.length; i++) if (bitDiff(f1[i], r1[i])) throw new Error("fgemm2 transA leg differs");
@@ -559,7 +615,7 @@
 
       const viaLUT = { backend: "webgpu", label: `${gpuName} (LUT shader · exact-gated)`,
                        matmulInt8: (Xq, Wq, m, k, n) => gpuMatmulLUT(device, lutPipe, lutBuf, Xq, Wq, m, k, n),
-                       bgemm: bgLut, att, fgemm, fgemm2, mlp: mlpLut };
+                       bgemm: bgLut, att, fgemm, fgemm2, fgemmFma, mlp: mlpLut };
 
       // DP4A pipeline — only if the WGSL feature exists AND its batched kernel
       // reproduces the verified units exactly across the shape sweep
@@ -587,7 +643,7 @@
       // worse than a fixed choice. DP4A ships: it wins the int8-backward mode
       // by ~12% and ties elsewhere.
       return { backend: "webgpu", label: `${gpuName} (DP4A int8 dot · exact-gated vs units)`,
-               bgemm: bg, att, fgemm, fgemm2, mlp: mlpDp4 };
+               bgemm: bg, att, fgemm, fgemm2, fgemmFma, mlp: mlpDp4 };
     } catch (e) { console.warn("WebGPU init failed, CPU fallback:", e); return cpu; }
   }
 
@@ -611,6 +667,7 @@
   }
 
   async function gpuMatmulLUT(device, pipeline, lutBuf, Xq, Wq, m, k, n) {
+    root.Verified.accBound(k, "gpuMatmulLUT");                  // WGSL `var s : i32` wraps past this
     const X32 = Int32Array.from(Xq), W32 = Int32Array.from(Wq);   // byte -> i32
     const bufX = up(device, X32, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufW = up(device, W32, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -626,6 +683,7 @@
   // attention kernels: int8 (widened i32) in, f32 out, strided head indexing
   async function gpuAttScores(device, pipeline, qq, kq, qs, ks, d) {
     const { B, T, heads } = d;
+    root.Verified.accBound(d.hd, "gpuAttScores");
     const bufQ = up(device, Int32Array.from(qq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufK = up(device, Int32Array.from(kq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufQs = up(device, qs, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -640,6 +698,7 @@
   }
   async function gpuAttCtx(device, pipeline, aq, vq, as, vs, d) {
     const { B, T, heads, hd } = d;
+    root.Verified.accBound(T, "gpuAttCtx");
     const bufA = up(device, Int32Array.from(aq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufV = up(device, Int32Array.from(vq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufAs = up(device, as, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -759,6 +818,7 @@
 
   async function gpuBgemmLUT(device, pipeline, lutBuf, Xq, Wq, rs, cs, d) {
     const { m, k, n } = d, batch = d.batch || 1, flags = d.relu ? 1 : 0;
+    root.Verified.accBound(k, "gpuBgemmLUT");
     const bufX = up(device, Int32Array.from(Xq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufW = up(device, Int32Array.from(Wq), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     const bufR = up(device, rs, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -775,6 +835,7 @@
 
   async function gpuBgemmDP4(device, pipeline, Xq, Wq, rs, cs, d) {
     const { m, k, n } = d, batch = d.batch || 1, flags = d.relu ? 1 : 0;
+    root.Verified.accBound(k, "gpuBgemmDP4");
     const kw = Math.ceil(k / 4);
     const Xp = packRows(Xq, batch * m, k, kw);            // rows are (batch·m)
     const Wp = new Uint32Array(batch * n * kw);           // per-batch Wᵀ, packed
@@ -801,6 +862,7 @@
   // left operand is produced and consumed entirely on the GPU.
   async function gpuMlpChain(device, env, xq, w1q, w2q, xs, w1s, w2s, d) {
     const { m, k, h, n } = d, dp4 = !!env.dp4;
+    root.Verified.accBound(k, "gpuMlpChain gemm1"); root.Verified.accBound(h, "gpuMlpChain gemm2");
     const SU = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     let bufX, bufW1, bufW2, kw1, hw;
     if (dp4) {
@@ -850,7 +912,12 @@
     const mx = new Float32Array(readM.getMappedRange(0, m * 4).slice(0)); readM.unmap();
     // scale derivation in JS f64 — exactly rounded, identical on every device
     // (WGSL division is 2.5 ULP, which is why it never runs on the GPU)
-    const sc = root.Verified.scalesFromAbsMax(mx);
+    let sc;
+    try { sc = root.Verified.scalesFromAbsMax(mx); }   // refuses a non-finite row max
+    catch (e) {                                        // hand the pooled buffers back first
+      release(device, [bufX, bufW1, bufW2, bufRs, bufCs1, bufCs2, bufH, bufMX, bufD1, bufDM, readH, readM]);
+      throw e;
+    }
     const bufInv = up(device, sc.inv, SU), bufHs = up(device, sc.scale, SU);
     const bufQ = mk(device, m * hw * 4, GPUBufferUsage.STORAGE);
     const bufDQ = up(device, new Uint32Array([m, h, hw, 0]), UU);

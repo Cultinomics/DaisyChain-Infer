@@ -26,6 +26,14 @@ The rest of this file is the previous guide. This list, and every later note mar
 - One weight range stays in flight while the previous body is widened to f32.
 - A dropped peer or a stalled lap is replayed once. Weights still come from the Hub.
 
+## Added 2026-10-23
+
+- A stage with two or more layers packs those weights into one flat buffer and unpacks at most two layers during a forward. Embeddings and `lm_head` stay put. Weights do not cross the ring.
+- Optimizer states, reduced gradients, a peer parameter all-gather, and tiled re-quantization are not implemented.
+- From DeepInfer: sliding-window softmax mask, sampling tied to the token position, a JSON mask on the top 40 completion tokens, and tokenizing the next queued prompt during the current turn.
+- Not from DeepInfer: CUDA kernels, expert parallelism, a confidence-head draft model, compact KV replay, disaggregated prefill.
+- DeepGEMM's FP8 and FP4 kernels are not used. A scale every 128 channels of K is a different number from the one INT8 scale per row and per column.
+
 ```bash
 npm install
 npm start            # http://localhost:8788
@@ -77,6 +85,25 @@ The compute units are the live DaisyChain-Train browser cores (Hub revision `a28
 - On the full-window path, a repeated suffix is drafted and scored in one lap. Matching drafts are kept, plus the first disagreement.
 - One weight range stays in flight while the previous body is widened to f32.
 - A dropped peer or a stalled lap is replayed **once** from the start. Weights still come from the Hub.
+
+## Parameter shard *(added 2026-10-23)*
+
+ZeRO stages 1 and 2 do not apply here. There is no optimizer and no backward. Parameters are not gathered from other devices.
+
+When a stage owns two or more layers, those weights sit in one flat buffer. A forward unpacks the current layer and the next one, runs the layer, then drops the one just used. At most **2** layers are unpacked. A single layer stays resident. The embedding and `lm_head` are not in the shard. The bytes the GEMM reads are the same bytes, so a full-window split stays bit-identical. The flat buffer does not reduce the stage below one copy of its parameters.
+
+## DeepInfer *(added 2026-10-23)*
+
+DeepInfer's CUDA kernels, expert parallelism, and KV cluster are not used.
+
+- A model with `use_sliding_window` and a positive `sliding_window` masks attention outside that window on layers at or after `max_window_layers`. The GEMM still includes every key, so the int8 scales do not change. Compact replay, which drops old keys, is not done.
+- Above temperature 0, each token position has its own draw from the seed.
+- Output set to JSON keeps the completion inside a JSON value, using the top **40** tokens. The hidden state is already finished before the mask.
+- The next queued prompt is tokenized while the current turn runs. One turn still owns the ring.
+
+## DeepGEMM *(added 2026-10-23)*
+
+DeepGEMM's CUDA GEMMs, grouped expert GEMMs, and indexer are not used. The verified GEMM keeps one INT8 scale for a whole activation row and one for a whole weight column. A 128-channel scale would change the products. K above **131071** is still refused.
 
 ## The ring
 
@@ -178,6 +205,7 @@ Without those, a test where both sides call the same code proves nothing.
 *(added 2026-10-22)* The same file also checks a dropped probe, a refused non-finite activation,
 a chunked prefill across a split, and a lookahead draft across a split. The
 chunked path is compared to itself, not to the full-window GEMM.
+*(added 2026-10-23)* The same file checks that a flat parameter shard matches a resident forward, on the full window and on one chunk, and that a third live layer is refused. It also checks a sliding-window mask across a split, a JSON mask, a position seed, a prepared prompt, and that a 128-channel weight scale differs from the verified column scale.
 
 This was also confirmed against a real model: SmolLM-135M's 30 layers split
 `[10,10,10]`, `[1,14,15]`, `[0,15,15]` and `[5,5,5,5,5,5]` all produced token

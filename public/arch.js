@@ -63,7 +63,16 @@
       // GPT-2's Conv1D stores (in, out) — already the k x n our GEMM wants.
       // torch.nn.Linear stores (out, in) and must be transposed at load.
       weightLayout: family === "gpt2" ? "in_out" : "out_in",
+      // Sliding window is mask-only. 0 means full causal attention.
+      // Layers with index < swaFrom stay full even when a window is set
+      // (Qwen2's max_window_layers). Compact KV truncation is not done here.
+      slidingWindow: 0,
+      swaFrom: 0,
     };
+    if (family === "llama" && cfg.use_sliding_window && +cfg.sliding_window > 0) {
+      spec.slidingWindow = cfg.sliding_window | 0;
+      spec.swaFrom = cfg.max_window_layers != null ? cfg.max_window_layers | 0 : 0;
+    }
     if (spec.gated && !cfg.intermediate_size)
       throw new Error("a gated MLP needs intermediate_size in config.json");
     if (spec.kvHeads && spec.heads % spec.kvHeads !== 0)

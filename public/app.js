@@ -18,7 +18,7 @@ const ui = {};
 for (const id of ["status", "backend", "me", "peers", "log", "requests", "roomInfo", "roomCode",
                   "copyLink", "model", "tokenizer", "plan", "myShard", "prompt", "genBtn",
                   "stopBtn", "out", "tps", "tokcount", "hops", "temp", "vtemp", "ntok", "vntok",
-                  "seed", "verify", "verifyRow", "ringState", "repo", "revision", "loadRepo",
+                  "seed", "schema", "verify", "verifyRow", "ringState", "repo", "revision", "loadRepo",
                   "modelState", "ctxLen", "vctxLen", "tokenState", "clearToken",
                   "tokModal", "tokInput", "tokOk", "tokCancel", "tokWhy",
                   "tokPasteRow", "tokSignIn", "tokSignInBtn",
@@ -636,7 +636,8 @@ async function loadMyStage(assign, st) {
   stageObj = Infer.makeStage(s, st, w, kernelCtx(), assign.ctx || ctxLen());
   stageObj.pass = assign.pass === "chunk" ? "chunk" : "window";
   spec = s;
-  ui.myShard.textContent = `${st.head ? "head + " : ""}layers ${st.lo}–${st.hi - 1} · ${mb.toFixed(0)} MB resident`;
+  ui.myShard.textContent = `${st.head ? "head + " : ""}layers ${st.lo}–${st.hi - 1} · ${mb.toFixed(0)} MB` +
+    (stageObj.paramShard ? " flat shard, 2 layers live" : " resident");
   return stageObj;
 }
 
@@ -764,11 +765,25 @@ async function onAct(peerId, buf) {
 }
 
 const promptQueue = [];
+let scheduledPrompt = null;
+
+// Tokenize the next queued prompt while this turn still holds the ring.
+// The forward itself stays serial. Weights are not touched here.
+function scheduleQueued() {
+  if (!tok || !promptQueue.length) return;
+  const text = promptQueue[0];
+  if (!text) return;
+  if (scheduledPrompt && scheduledPrompt.text === text) return;
+  let ids = [...Tokenizer.encode(tok, text)];
+  if (!ids.length) ids = [0];
+  scheduledPrompt = { text, ids };
+}
 
 async function generate(isReplay) {
   if (running) {
     const waiting = (ui.prompt.value || "").slice(0, 80);
     promptQueue.push(ui.prompt.value);
+    scheduleQueued();
     log(`ring busy — queued (${promptQueue.length} waiting): "${waiting}". The turn already generating keeps the ring.`);
     return;
   }
@@ -782,8 +797,11 @@ async function generate(isReplay) {
     plan = buildPlan(); modelHash = repoInfo.fingerprint; spec = repoInfo.spec;
     renderPlan();
     const promptText = ui.prompt.value || "The";
-    let idsPreview = [...Tokenizer.encode(tok, promptText)];
+    const prepared = Shard.preparedIds(promptText, scheduledPrompt);
+    scheduledPrompt = null;
+    let idsPreview = prepared ? prepared : [...Tokenizer.encode(tok, promptText)];
     if (!idsPreview.length) idsPreview = [0];
+    if (prepared) log("prompt was scheduled while the previous turn held the ring.");
     const fits = Shard.headCanHold(spec, repoInfo.tensors, navigator.deviceMemory || 0);
     const local = Shard.preferLocal(idsPreview.length, plan.length - 1, fits);
     const chatKey = String((prefixIndex.blocks(idsPreview)[0]) || "empty");
@@ -815,6 +833,7 @@ async function generate(isReplay) {
           pass: willChunk ? "chunk" : "window",
         }));
       log("waiting for every stage to fetch its layers…");
+      scheduleQueued();
       const ok = await waitFor(() => readyStages.size >= plan.length - 1, 600000);
       if (!ok) { log("not every stage reported ready — generating anyway will stall, so stopping here."); throw new Error("stages not ready"); }
     } else {
@@ -826,7 +845,12 @@ async function generate(isReplay) {
 
     const seq = ++runSeq;
     const nTok = +ui.ntok.value, temp = +ui.temp.value / 100;
-    const opts = { temperature: temp, topK: 40, rng: Infer.mulberry32(+ui.seed.value | 0) };
+    const schema = ui.schema && ui.schema.value === "json" ? "json" : "";
+    const opts = {
+      temperature: temp, topK: 40, seqSeed: +ui.seed.value | 0, schema,
+      decodeSeq: (arr) => Tokenizer.decode(tok, arr), promptLen: idsPreview.length,
+    };
+    if (schema === "json") log("JSON mask on the completion. Top 40 tokens. The hidden state is unchanged.");
     let ids = idsPreview.slice();
     prefixIndex.note(chatKey, ids);
     // The bytes kept here are the prefix-block hashes, not layer KV. Reusing
@@ -859,6 +883,7 @@ async function generate(isReplay) {
         await sendTo(plan[1].id, packAct(seq, index, plan[1].index, hidden));
         hops += plan.length;
         const key = `${seq}:${index}`;
+        scheduleQueued();
         const ok = await waitFor(() => actIn.has(key) || peerDropped, 60000);
         if (peerDropped) throw new Error("peer dropped");
         if (!ok) throw new Error("stalled");
@@ -882,7 +907,8 @@ async function generate(isReplay) {
       let produced = 0;
       while (produced < nTok && !abortRun && last) {
         const row = (last.length / spec.hidden) - 1;
-        const id = Infer.pickToken((await Infer.logitsAt(stageObj, last, [row]))[0], opts);
+        const id = Infer.sampleAt((await Infer.logitsAt(stageObj, last, [row]))[0], opts, ids.length,
+                                  opts.decodeSeq, ids.slice(promptLen));
         ids.push(id); produced++;
         ui.out.textContent = Tokenizer.decode(tok, ids);
         ui.tokcount.textContent = String(produced);
@@ -909,13 +935,16 @@ async function generate(isReplay) {
         await sendTo(plan[1].id, packAct(seq, produced, plan[1].index, x));
         hops += plan.length;
         const key = `${seq}:${produced}`;
+        scheduleQueued();
         const ok = await waitFor(() => actIn.has(key) || peerDropped, 60000);
         if (peerDropped) throw new Error("peer dropped");
         if (!ok) throw new Error("stalled");
         x = actIn.get(key); actIn.delete(key);
       }
       const rows = Infer.draftRows(T, frame.shown, draft.length);
-      const picked = (await Infer.logitsAt(stageObj, x, rows)).map(l => Infer.pickToken(l, opts));
+      const logitRows = await Infer.logitsAt(stageObj, x, rows);
+      const picked = logitRows.map((l, i) => Infer.sampleAt(
+        l, opts, ids.length + i, opts.decodeSeq, ids.slice(promptLen).concat(draft.slice(0, i))));
       const got = Shard.acceptDraft(picked, draft);
       if (draft.length) log(`draft span ${draft.length}, accepted ${Math.max(0, got.length - 1)} before the bonus token. One lap.`);
       for (const id of got) {
@@ -940,11 +969,14 @@ async function generate(isReplay) {
       const all = { id: myId, index: 0, lo: 0, hi: spec.layers, head: true };
       const solo = await loadMyStage({ repo: repoInfo.repo, revision: repoInfo.revision, spec, ctx: T }, all);
       const promptIds = Tokenizer.encode(tok, ui.prompt.value || "The");
+      const verifyOpts = {
+        temperature: temp, topK: 40, seqSeed: +ui.seed.value | 0, schema,
+        decodeSeq: (arr) => Tokenizer.decode(tok, arr),
+        promptLen: promptIds.length ? promptIds.length : 1, maxDraft: 4,
+      };
       const ref = useChunks
-        ? await Infer.generateChunked([solo], promptIds.length ? promptIds : [0], nTok, 16,
-                                      { temperature: temp, topK: 40, rng: Infer.mulberry32(+ui.seed.value | 0) })
-        : await Infer.generateLookahead([solo], promptIds.length ? promptIds : [0], nTok, T,
-                                      { temperature: temp, topK: 40, rng: Infer.mulberry32(+ui.seed.value | 0), maxDraft: 4 });
+        ? await Infer.generateChunked([solo], promptIds.length ? promptIds : [0], nTok, 16, verifyOpts)
+        : await Infer.generateLookahead([solo], promptIds.length ? promptIds : [0], nTok, T, verifyOpts);
       const same = ref.length === ids.length && ref.every((v, i) => v === ids[i]);
       log(same ? "VERIFIED: the distributed run and the single-device run produced identical token ids."
                : `MISMATCH: the ring and this device disagree. Distributed "${Tokenizer.decode(tok, ids).slice(0, 60)}" ` +

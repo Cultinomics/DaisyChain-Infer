@@ -177,6 +177,12 @@
     <p class="note" style="margin:.3rem 0 .6rem">0 = greedy, which is deterministic and therefore checkable. Above 0, sampling follows the seed so runs stay reproducible.</p>
     <label class="slbl">Seed</label>
     <input type="number" id="seed" value="1234" style="width:140px">
+    <label class="slbl">Output</label>
+    <select id="schema" style="width:140px">
+      <option value="">free</option>
+      <option value="json">JSON</option>
+    </select>
+    <p class="note" style="margin:.3rem 0 .6rem">JSON constrains the completion only. The mask checks the top 40 tokens. The hidden state stays the same. Above temperature 0, the seed is tied to the token position.</p>
     <div class="row" id="verifyRow" style="display:none;margin-top:10px">
       <label class="note" style="display:flex;gap:8px;align-items:center;cursor:pointer">
         <input type="checkbox" id="verify"> Verify afterwards against a single-device run

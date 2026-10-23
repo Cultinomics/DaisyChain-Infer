@@ -114,6 +114,8 @@
         ly.Wfc = toKN(pick(t.Wfc), spec.inter, C, L); ly.bfc = pick(t.bfc, true);
       }
       ly.Wdown = toKN(pick(t.Wdown), C, spec.inter, L); ly.bdown = pick(t.bdown, true);
+      const sw = spec.slidingWindow | 0;
+      ly.swa = sw > 0 && l >= (spec.swaFrom | 0) ? sw : 0;
       w.layers.push(ly);
     }
     return w;
@@ -123,6 +125,68 @@
     for (let v = 0; v < vocab; v++)
       for (let c = 0; c < C; c++) out[c * vocab + v] = emb[v * C + c];
     return out;
+  }
+
+  // ---- parameter shard (ZeRO-3 / FSDP FULL_SHARD, forward only) --------------
+  // A stage that owns two or more layers keeps those weights in one flat
+  // Float32 buffer. A forward gathers the current layer as views into that
+  // buffer, prefetches the next, runs it, then drops the views. At most two
+  // layers are unpacked (FSDP limit_all_gathers + forward_prefetch +
+  // reshard-after-forward). The flat buffer is the CPU-resident copy.
+  // Embeddings, the final norm, and lm_head are not in this shard.
+  // The views alias the buffer. The GEMM only reads them, so the bytes the
+  // kernel sees are the bytes that were resident. No optimizer state, no
+  // gradient, and no copy of a parameter is sent to a peer.
+  const PARAM_KEYS = ["nrm1", "nrm1b", "nrm2", "nrm2b",
+                      "Wqkv", "bqkv", "Wq", "bq", "Wk", "bk", "Wv", "bv",
+                      "Wo", "bo", "Wgate", "Wup", "Wfc", "bfc", "Wdown", "bdown"];
+  const GATHER_LIMIT = 2;
+
+  function makeParamShard(layers) {
+    if (!layers || layers.length < 2) return null;
+    const slices = [];
+    let n = 0;
+    for (let i = 0; i < layers.length; i++) {
+      const parts = [];
+      const ly = layers[i];
+      for (const k of PARAM_KEYS) {
+        const a = ly[k];
+        if (a && a.length) {
+          parts.push({ k, off: n, len: a.length });
+          n += a.length;
+        }
+      }
+      slices.push(parts);
+    }
+    const flat = new Float32Array(n);
+    for (let i = 0; i < layers.length; i++)
+      for (const p of slices[i]) flat.set(layers[i][p.k], p.off);
+    for (let i = 0; i < layers.length; i++) {
+      for (const p of slices[i]) layers[i][p.k] = null;
+      layers[i]._gathered = false;
+    }
+    return { flat, slices, live: 0, maxLive: 0, limit: GATHER_LIMIT };
+  }
+
+  function gatherLayer(shard, layers, i) {
+    const ly = layers[i];
+    if (ly._gathered) return ly;
+    if (shard.live >= shard.limit)
+      throw new Error("param gather would exceed " + shard.limit + " live layers");
+    for (const p of shard.slices[i])
+      ly[p.k] = shard.flat.subarray(p.off, p.off + p.len);
+    ly._gathered = true;
+    shard.live++;
+    if (shard.live > shard.maxLive) shard.maxLive = shard.live;
+    return ly;
+  }
+
+  function releaseLayer(shard, layers, i) {
+    const ly = layers[i];
+    if (!ly || !ly._gathered) return;
+    for (const p of shard.slices[i]) ly[p.k] = null;
+    ly._gathered = false;
+    shard.live--;
   }
 
   // ---- hashes -----------------------------------------------------------------
@@ -333,6 +397,136 @@
     return { draft, shown: shown.length, win: shown.slice() };
   }
 
+  // The text of a prompt that was tokenized while an earlier turn still held
+  // the ring. Used only when the text still matches. Returns a copy.
+  function preparedIds(text, prepared) {
+    if (!prepared || prepared.text !== text || !prepared.ids || !prepared.ids.length) return null;
+    return prepared.ids.slice();
+  }
+
+  // JSON value scanner for a completion constraint. "ok" is a finished value,
+  // "need" is a legal prefix, "bad" is a broken one. Incomplete is allowed.
+  function jsonStatus(text) {
+    const s = String(text || "");
+    let i = 0;
+    const n = s.length;
+    function ws() {
+      while (i < n && (s[i] === " " || s[i] === "\n" || s[i] === "\r" || s[i] === "\t")) i++;
+    }
+    function string() {
+      i++;
+      while (i < n) {
+        const c = s[i++];
+        if (c === "\"") return "ok";
+        if (c === "\\") {
+          if (i >= n) return "need";
+          const e = s[i++];
+          if ("\"\\/bfnrt".indexOf(e) >= 0) continue;
+          if (e === "u") {
+            if (i + 4 > n) return "need";
+            const hex = s.slice(i, i + 4);
+            if (!/^[0-9a-fA-F]{4}$/.test(hex)) return "bad";
+            i += 4;
+            continue;
+          }
+          return "bad";
+        }
+        if (c < " ") return "bad";
+      }
+      return "need";
+    }
+    function number() {
+      if (s[i] === "-") i++;
+      if (i >= n) return "need";
+      if (s[i] === "0") i++;
+      else if (s[i] >= "1" && s[i] <= "9") { while (i < n && s[i] >= "0" && s[i] <= "9") i++; }
+      else return "bad";
+      if (i >= n) return "need";
+      if (s[i] === ".") {
+        i++;
+        if (i >= n) return "need";
+        if (s[i] < "0" || s[i] > "9") return "bad";
+        while (i < n && s[i] >= "0" && s[i] <= "9") i++;
+      }
+      if (i < n && (s[i] === "e" || s[i] === "E")) {
+        i++;
+        if (i >= n) return "need";
+        if (s[i] === "+" || s[i] === "-") i++;
+        if (i >= n) return "need";
+        if (s[i] < "0" || s[i] > "9") return "bad";
+        while (i < n && s[i] >= "0" && s[i] <= "9") i++;
+      }
+      return "ok";
+    }
+    function literal() {
+      const rest = s.slice(i);
+      const words = ["true", "false", "null"];
+      for (let w = 0; w < words.length; w++) {
+        const word = words[w];
+        if (rest.indexOf(word) === 0) { i += word.length; return "ok"; }
+        if (word.indexOf(rest) === 0) return "need";
+      }
+      return "bad";
+    }
+    function value() {
+      ws();
+      if (i >= n) return "need";
+      const c = s[i];
+      if (c === "{") return object();
+      if (c === "[") return array();
+      if (c === "\"") return string();
+      if (c === "-" || (c >= "0" && c <= "9")) return number();
+      return literal();
+    }
+    function object() {
+      i++;
+      ws();
+      if (i >= n) return "need";
+      if (s[i] === "}") { i++; return "ok"; }
+      for (;;) {
+        ws();
+        if (i >= n) return "need";
+        if (s[i] !== "\"") return "bad";
+        const key = string();
+        if (key !== "ok") return key;
+        ws();
+        if (i >= n) return "need";
+        if (s[i] !== ":") return "bad";
+        i++;
+        const v = value();
+        if (v !== "ok") return v;
+        ws();
+        if (i >= n) return "need";
+        if (s[i] === "}") { i++; return "ok"; }
+        if (s[i] !== ",") return "bad";
+        i++;
+      }
+    }
+    function array() {
+      i++;
+      ws();
+      if (i >= n) return "need";
+      if (s[i] === "]") { i++; return "ok"; }
+      for (;;) {
+        const v = value();
+        if (v !== "ok") return v;
+        ws();
+        if (i >= n) return "need";
+        if (s[i] === "]") { i++; return "ok"; }
+        if (s[i] !== ",") return "bad";
+        i++;
+      }
+    }
+    const st = value();
+    if (st !== "ok") return st;
+    ws();
+    if (i < n) return "bad";
+    return "ok";
+  }
+  function jsonAllows(soFar, more) {
+    return jsonStatus(String(soFar || "") + String(more == null ? "" : more)) !== "bad";
+  }
+
   function acceptDraft(picked, draft) {
     const out = [];
     let i = 0;
@@ -345,7 +539,8 @@
                 fnv1a, hashF32, modelFingerprint, ringMembers, estimateLapMs,
                 headCanHold, preferLocal, makePrefixIndex, makeKvSpill,
                 prefillChunks, promptLookupDraft, acceptDraft, lookaheadFrame,
-                estimatePlanMs };
+                estimatePlanMs, makeParamShard, gatherLayer, releaseLayer,
+                PARAM_KEYS, GATHER_LIMIT, preparedIds, jsonStatus, jsonAllows };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.Shard = api;
 })(typeof self !== "undefined" ? self : this);

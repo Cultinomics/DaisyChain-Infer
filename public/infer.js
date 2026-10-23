@@ -180,13 +180,17 @@
       const khT = TC.transpose(kh, N, hd);                       // hd x N
       const scores = await V.vgemmBlock(qh, khT, { m: T, k: hd, n: N, batch: 1 }, ctx.L, ctx.bgemm, ctx.audit);
       const a = new Float32Array(T * N);                          // causal softmax
+      const swa = ly.swa | 0;
       for (let i = 0; i < T; i++) {
         const see = n0 + i;                                       // this query's own position in the cache
+        // Mask mode only. Columns outside the window stay in the GEMM, so
+        // per-column int8 scales match a full causal matrix. Softmax drops them.
+        const oldest = swa > 0 ? Math.max(0, see - (swa - 1)) : 0;
         let mx = -Infinity;
-        for (let j = 0; j <= see; j++) mx = Math.max(mx, scores[i * N + j] * scale);
+        for (let j = oldest; j <= see; j++) mx = Math.max(mx, scores[i * N + j] * scale);
         let z = 0;
-        for (let j = 0; j <= see; j++) { const e = Math.exp(scores[i * N + j] * scale - mx); a[i * N + j] = e; z += e; }
-        for (let j = 0; j <= see; j++) a[i * N + j] /= z;
+        for (let j = oldest; j <= see; j++) { const e = Math.exp(scores[i * N + j] * scale - mx); a[i * N + j] = e; z += e; }
+        for (let j = oldest; j <= see; j++) a[i * N + j] /= z;
       }
       const oh = await V.vgemmBlock(a, vh, { m: T, k: N, n: hd, batch: 1 }, ctx.L, ctx.bgemm, ctx.audit);
       for (let t = 0; t < T; t++) ctxOut.set(oh.subarray(t * hd, t * hd + hd), t * qDim + h * hd);
@@ -217,8 +221,13 @@
   }
 
   // ---- stage ------------------------------------------------------------------
-  function makeStage(spec, st, w, ctx, T) {
+  function makeStage(spec, st, w, ctx, T, opts) {
     const S = { spec, st, w, ctx, T: T || Math.min(spec.maxPos, 128) };
+    // Two or more layers: one flat parameter shard, gathered per layer.
+    // opts.resident keeps the old layout for the bit-identity check.
+    const resident = opts && opts.resident;
+    S.paramShard = (!resident && w.layers && w.layers.length >= 2)
+      ? SH.makeParamShard(w.layers) : null;
     if (spec.rope) S.rope = ropeTables(spec.headDim, spec.ropeTheta, S.T + 1);
     return S;
   }
@@ -236,12 +245,39 @@
     return x;
   }
 
+  // Walk this stage's layers. With a parameter shard, gather layer i, prefetch
+  // i+1, run the same layerForward, then release i. At most two layers hold
+  // views. Without a shard the arrays stay on the layer objects.
+  async function forwardLayers(S, x, span) {
+    const layers = S.w.layers;
+    const shard = S.paramShard;
+    if (!shard) {
+      if (span) {
+        for (let li = 0; li < layers.length; li++) {
+          span.li = li;
+          x = await layerForward(S, x, layers[li], span);
+        }
+      } else {
+        for (const ly of layers) x = await layerForward(S, x, ly);
+      }
+      return x;
+    }
+    for (let li = 0; li < layers.length; li++) {
+      SH.gatherLayer(shard, layers, li);
+      if (li + 1 < layers.length) SH.gatherLayer(shard, layers, li + 1);
+      if (span) span.li = li;
+      x = await layerForward(S, x, layers[li], span || undefined);
+      SH.releaseLayer(shard, layers, li);
+    }
+    return x;
+  }
+
   async function runLayers(S, x) {
     // A non-finite activation used to quantize to a silent zero and keep
     // travelling. Train refuses it (NonFiniteError). A hop must too: the
     // next stage would otherwise agree on a wrong sum.
     V.assertFinite(x, "activation");
-    for (const ly of S.w.layers) x = await layerForward(S, x, ly);
+    x = await forwardLayers(S, x, null);
     V.assertFinite(x, "activation");
     return x;
   }
@@ -254,10 +290,7 @@
     const C = S.spec.hidden;
     const T = (x.length / C) | 0;
     if (T < 1 || T * C !== x.length) throw new Error("chunk length is not a whole number of rows");
-    for (let li = 0; li < S.w.layers.length; li++) {
-      span.li = li;
-      x = await layerForward(S, x, S.w.layers[li], span);
-    }
+    x = await forwardLayers(S, x, span);
     V.assertFinite(x, "activation");
     return x;
   }
@@ -319,7 +352,8 @@
     }
     for (let n = 0; n < nNew; n++) {
       const row = (last.length / stages[0].spec.hidden) - 1;
-      const id = pickToken((await logitsAt(stages[0], last, [row]))[0], opts);
+      const id = sampleAt((await logitsAt(stages[0], last, [row]))[0], opts, ids.length,
+                          opts && opts.decodeSeq, ids.slice(ids0.length));
       ids.push(id);
       const pos = ids.length - 1;
       let x = embedRows(stages[0], [id], pos);
@@ -347,6 +381,12 @@
 
   // ---- sampling ---------------------------------------------------------------
   function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  // One draw for absolute position `pos`. A longer or shorter draft does not
+  // move the draw for a later position.
+  function seqDraw(seed, pos) {
+    let a = (seed | 0) ^ Math.imul((pos | 0) + 1, 0x9E3779B1);
+    return mulberry32(a)();
+  }
   function pickToken(logits, opts) {
     const o = opts || {}, temp = o.temperature ?? 0, vocab = logits.length;
     if (!temp) {
@@ -355,14 +395,53 @@
       return best;
     }
     const k = Math.min(o.topK || 40, vocab);
-    const idx = Array.from({ length: vocab }, (_, i) => i).sort((a, b) => logits[b] - logits[a]).slice(0, k);
+    const idx = Array.from({ length: vocab }, (_, i) => i).sort((a, b) => logits[b] - logits[a] || a - b).slice(0, k);
     let mx = -Infinity;
     for (const i of idx) mx = Math.max(mx, logits[i] / temp);
     let z = 0;
     const p = idx.map(i => { const e = Math.exp(logits[i] / temp - mx); z += e; return e; });
-    let r = (o.rng || Math.random)() * z;
+    const draw = (o.seqSeed != null && o.pos != null) ? () => seqDraw(o.seqSeed, o.pos) : (o.rng || Math.random);
+    let r = draw() * z;
     for (let i = 0; i < idx.length; i++) { r -= p[i]; if (r <= 0) return idx[i]; }
     return idx[idx.length - 1];
+  }
+
+  // Head-side JSON mask. The hidden state is already computed. Only the pick
+  // changes, and only among the top-K logits. No legal candidate falls back
+  // to the unconstrained pick.
+  function pickStructured(logits, opts) {
+    const o = opts || {};
+    if (o.schema !== "json" || typeof o.decodePiece !== "function") return pickToken(logits, o);
+    const produced = o.produced || "";
+    const vocab = logits.length;
+    const k = Math.min(o.topK || 40, vocab);
+    const idx = Array.from({ length: vocab }, (_, i) => i).sort((a, b) => logits[b] - logits[a] || a - b).slice(0, k);
+    const legal = [];
+    for (const id of idx) {
+      let piece;
+      try { piece = o.decodePiece(id); } catch (e) { continue; }
+      if (piece == null) continue;
+      if (SH.jsonAllows(produced, piece)) legal.push(id);
+    }
+    if (!legal.length) return pickToken(logits, o);
+    if (!(o.temperature ?? 0)) return legal[0];
+    const fake = new Float32Array(vocab);
+    fake.fill(-Infinity);
+    for (const id of legal) fake[id] = logits[id];
+    return pickToken(fake, o);
+  }
+
+  function sampleAt(logits, opts, pos, decodeSeq, baseIds) {
+    const local = Object.assign({}, opts || {}, { pos: pos | 0 });
+    if (local.schema === "json" && typeof decodeSeq === "function" && baseIds) {
+      local.produced = decodeSeq(baseIds);
+      local.decodePiece = (id) => {
+        const prev = local.produced;
+        const next = decodeSeq(baseIds.concat([id]));
+        return next.startsWith(prev) ? next.slice(prev.length) : next;
+      };
+    }
+    return pickStructured(logits, local);
   }
 
   // ---- single-device reference ------------------------------------------------
@@ -386,6 +465,8 @@
     const ids = [...ids0];
     const head = stages[0];
     const maxDraft = opts && opts.maxDraft != null ? opts.maxDraft : 4;
+    const promptLen = opts && opts.promptLen != null ? opts.promptLen | 0 : ids0.length;
+    const decodeSeq = opts && opts.decodeSeq;
     let produced = 0;
     while (produced < nNew) {
       const frame = SH.lookaheadFrame(ids, T, maxDraft);
@@ -396,7 +477,11 @@
       for (const S of stages) x = await runLayers(S, x);
       const rows = draftRows(T, frame.shown, draft.length);
       const picked = [];
-      for (const logits of await logitsAt(head, x, rows)) picked.push(pickToken(logits, opts));
+      const logitRows = await logitsAt(head, x, rows);
+      for (let i = 0; i < logitRows.length; i++) {
+        const base = ids.slice(promptLen).concat(draft.slice(0, i));
+        picked.push(sampleAt(logitRows[i], opts, ids.length + i, decodeSeq, base));
+      }
       const got = SH.acceptDraft(picked, draft);
       if (!got.length) break;
       for (const id of got) {
@@ -410,7 +495,7 @@
 
   const api = { makeStage, embed, embedRows, runLayers, runLayersChunk, readout, logitsAt, draftRows,
                 generateLookahead,
-                pickToken, generateLocal, generateChunked,
+                pickToken, pickStructured, sampleAt, seqDraw, generateLocal, generateChunked,
                 rmsNorm, layerNorm, norm, ropeTables, applyRope, silu, gelu, mulberry32 };
   if (typeof module !== "undefined" && module.exports) {
     TC = require("./traincore.js"); V = require("./verified_core.js"); SH = require("./shard.js");

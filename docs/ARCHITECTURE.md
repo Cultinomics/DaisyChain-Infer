@@ -15,6 +15,15 @@ The rest of this file is the previous architecture note. This list is what chang
 - Prompts longer than 32 tokens on more than one stage use even chunks of about 16, two in flight, with per-stage KV. Not the full-window GEMM.
 - A second prompt is queued. A dropped planned peer or a stalled lap replays the prompt once. A non-finite hidden state is not forwarded.
 
+## Added 2026-10-23
+
+- `makeParamShard` packs a stage's layers into one flat Float32 buffer when the stage owns two or more. `runLayers` and `runLayersChunk` gather the current layer, prefetch the next, and release the one just used. The limit is 2 live layers.
+- Head tensors stay outside that buffer. A one-layer stage is not sharded. No optimizer state is stored. No parameter is sent to a peer.
+- A configured sliding window is a softmax mask. Key columns stay in the GEMM. `swaFrom` is `max_window_layers`.
+- `seqDraw(seed, pos)` samples one position. `pickStructured` applies a JSON mask to the top 40 logits on the head. `preparedIds` is the prompt tokenized during the previous turn.
+- DeepInfer kernels, expert parallel, the DSpark confidence head, compact KV truncation, and prefill/decode disaggregation are not implemented.
+- DeepGEMM is not linked. `quantizeCols` keeps one scale per weight column for the whole K. A 128-channel scale is a different recipe and is not called from `vgemmBlock`. `MAX_INT32_K` is 131071.
+
 ## The pieces
 
 | File | Role |
@@ -110,6 +119,8 @@ credentials. Weights never travel between peers, which means:
   rather than nine per layer;
 - *(added 2026-10-22)* the next range is requested while the previous body is widened to f32.
   The bytes do not change.
+- *(added 2026-10-23)* after the slice is arranged, a stage with two or more layers copies those layer weights into one flat buffer and drops the per-layer arrays. Embeddings, the final norm, and `lm_head` stay as separate arrays. A forward gathers at most two layers as views into the flat buffer (`forward_prefetch`, `limit_all_gathers` of 2, reshard after the layer). The views alias the buffer, so the GEMM sees the same bytes. ZeRO stage 1, ZeRO stage 2, a cross-peer all-gather, and tiled re-quantization are not done.
+- *(added 2026-10-23)* `layerForward` reads `ly.swa`. A positive window limits the softmax, not the score GEMM. The next queued prompt is tokenized during the wait. JSON masking happens in `sampleAt` after logits exist.
 
 ## One token
 

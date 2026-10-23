@@ -11,6 +11,12 @@ The rest of this file is the previous getting-started note. This list is what ch
 - New log lines: lap estimate for the whole plan, queued prompts, overlap prefill, draft span. A disagreeing probe is left out of the plan.
 - New failures: "a peer left the ring" (one replay), "REFUSED activation" for a non-finite hop, "refusing the run" when the lap estimate exceeds 120 seconds, "stays out of the plan: kernel probe".
 
+## Added 2026-10-23
+
+- A device that owns two or more layers shows `flat shard, 2 layers live` on its slice line. The weights are one buffer on that device. They are not fetched from a peer. A device with one layer still says `resident`.
+- Output can be `free` or `JSON`. JSON masks the completion. The seed above temperature 0 is tied to the token position. A prompt typed while a turn is running is tokenized before that turn ends.
+- DeepGEMM is not used. The multiply stays the verified INT8 GEMM, one scale per row and one per column.
+
 ## Run the server
 
 ```bash
@@ -119,7 +125,8 @@ few layers and no vocabulary.
 - **overlap prefill** — *(added 2026-10-22)* chunks of about 16, two in flight, per-stage KV. Not the
   full-window GEMM. Verify repeats this path.
 - **draft span** — *(added 2026-10-22)* a repeated suffix scored in one lap on the full-window path.
-- **my slice** — which layers this device holds and how much memory they take.
+- **my slice** — which layers this device holds and how much memory they take. *(added 2026-10-23)* Two or more layers are kept in one flat shard, with at most two unpacked during a forward. That does not shrink the download.
+- **Output** — *(added 2026-10-23)* `free` or `JSON`. JSON applies after the hop, to the top 40 tokens of the completion.
 
 ## Verify
 

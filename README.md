@@ -31,6 +31,14 @@ The rest of this file is the previous README. Everything in this list, and every
 - One weight range stays in flight while the previous body is widened to f32.
 - A planned peer other than the head dropping, or a stalled lap, replays the prompt once. Weights still come from the Hub.
 
+## Added 2026-10-23
+
+- ZeRO and FSDP, forward only, inside one stage. A stage with two or more layers packs those weights into one flat buffer and unpacks at most two layers for the forward. Embeddings and `lm_head` stay as they are. Weights still come from the Hub and do not cross the ring.
+- ZeRO stages 1 and 2 are not implemented. Infer has no optimizer and no backward. Parameters are not all-gathered across peers. `TiledLinear` is not used.
+- From DeepInfer: a sliding-window mask on layers that configure one, sampling tied to the token position, a JSON mask on the top 40 completion tokens, and tokenizing the next queued prompt while the current turn still runs.
+- Not taken from DeepInfer: CUDA kernels, expert parallelism, a draft-model confidence head, compact KV replay, disaggregated prefill, and a KV store.
+- DeepGEMM is not a second GEMM. Its FP8 and FP4 kernels, 128-channel scales, grouped MoE GEMM, and indexer stay out. The verified path keeps one INT8 scale per activation row and one per weight column.
+
 ---
 
 > **In plain terms:** point it at a Hugging Face model, open the page on two or
@@ -45,7 +53,7 @@ machines:
 ```bash
 npm install
 npm start            # http://localhost:8788
-npm test             # 47 checks: pipeline equivalence, wire protocol, loader
+npm test             # 59 checks: pipeline equivalence, wire protocol, loader
 ```
 
 Full walkthrough: **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** ·
@@ -97,6 +105,60 @@ On top of that, the head does a few things the old loop did not:
 - On the full-window path, a repeated suffix proposes the tokens that followed the earlier copy (prompt lookup, no second model). One lap scores that span. Matching drafts are kept, plus the first token that disagreed. If nothing repeats, the lap still produces one token.
 - Weight fetches keep one HTTP range in flight while the previous body is widened to f32. The bytes are the same.
 - If a peer disconnects or a lap stalls, the head drops that peer, replans, and reruns the prompt **once** from the start. Weights still come from the Hub, not from another device.
+
+## Parameter shard *(added 2026-10-23)*
+
+ZeRO and FSDP split training state across data-parallel ranks. This project does not train, so the parts that move optimizer moments or gradients are left out.
+
+What a stage does when it owns two or more layers:
+
+- Those layers' float32 weights are copied once into one flat buffer. The per-layer arrays are then dropped. The embedding, the final norm, and `lm_head` stay where they are. `lm_head` stays on the head.
+- A forward gathers the current layer as views into that buffer, prefetches the next layer, runs the same layer, then releases the one just used. At most **2** layers are unpacked.
+- The views alias the flat buffer. The GEMM reads them. The full-window path stays bit-identical to keeping every layer resident. The chunked path uses the same gather.
+- A stage with one layer keeps that layer resident.
+- Peak RAM is still one copy of the stage's parameters. The flat buffer does not make the slice smaller.
+- Weights are not sent to another device. Each device still fetches its own slice from the Hub.
+
+Left out on purpose:
+
+- ZeRO stage 1 (optimizer states) and stage 2 (reduced gradients). There is no Adam state and no backward.
+- A parameter all-gather across the ring. That would move weights on every token.
+- `TiledLinear`. Re-quantizing a matrix per tile would change the int8 scales.
+- NVMe offload. The flat buffer is the CPU-resident copy.
+
+## DeepInfer *(added 2026-10-23)*
+
+[DeepInfer](https://github.com/deepseek-ai/DeepInfer) serves DeepSeek-V4.1-Flash on NVIDIA SM100 and Ascend. Most of that stack does not fit a browser ring that only runs Llama-style and GPT-2-style blocks.
+
+Taken:
+
+- **Sliding-window mask.** If `use_sliding_window` is set and `sliding_window` is positive, layers with index `>= max_window_layers` drop attention outside that window. The GEMM still sees every key column, so the int8 scales stay the scales of the full matrix. A window wider than the cache matches full causal attention. `use_sliding_window: false` leaves the mask off.
+- **Position seed.** Above temperature 0, the draw for token position `p` depends on the seed and `p`. Scoring a longer draft does not move a later draw.
+- **JSON mask.** The Output control can require the completion to stay inside a JSON value. The head checks the top **40** tokens after the hidden state is already computed. No legal token in that set falls back to the unconstrained pick. This does not change the hop.
+- **Queued prompt.** The next prompt is tokenized while the current turn still holds the ring. The forward stays one turn at a time.
+
+Left out:
+
+- FlashMLA, DeepGEMM, DeepEP, TileKernels, and the other CUDA kernels. The verified INT8 units stay.
+- Attention data parallel, context parallel, MoE expert parallel, and expert load balancing.
+- DSpark's confidence head and next-n draft model. The prompt-lookup draft stays capped at **4** and is scored in the same window. Shortening that draft would not shrink the GEMM.
+- Compact SWA replay (the V4.1 keep of **140**, or a **128**-token recompute). Dropping key rows would change int8 scales. Prefix hits still recompute.
+- Disaggregated prefill and decode, the 3FS KV store, FP4 weights, and the multi-protocol recipe tokenizer.
+
+## DeepGEMM *(added 2026-10-23)*
+
+[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) is a CUDA kernel library for SM90 and SM100. It compiles FP8, FP4, and BF16 GEMMs at runtime, plus grouped MoE GEMMs, a fused Mega MoE, and the V3.2 indexer. None of those kernels run in this browser ring.
+
+The numeric recipe is the part that would matter, and it does not match. DeepGEMM's FP8 GEMM uses one scale per **128** channels of K (`BLOCK_K == 128`). A spike in a later block does not widen the scale of an earlier block. `vgemmBlock` uses one INT8 scale for the whole activation row and one for the whole weight column. Swapping in the 128-channel scale would change every product, including the split against the unsplit run. The test `a 128-channel weight scale is not the verified column scale` pins that difference. The forward path does not call a block scale.
+
+Also left out:
+
+- Grouped GEMMs, masked grouped GEMMs, and the K-grouped backward. This ring has no experts and no backward.
+- Mega MoE, NVLink overlap, and the lightning-indexer ReLU logits.
+- UE8M0 packed scales, TMA layout, programmatic dependent launch, and JIT CUDA.
+- A non-deterministic fast GEMM. The CPU mirror and the GPU kernel stay on the same INT8 units. K above **131071** is refused so the int32 accumulator does not wrap.
+
+Weights are already stored `k x n` once at load. That is the layout a non-transposed A times a transposed B expects. It is not a new kernel.
 
 ## The ring
 
@@ -198,7 +260,13 @@ Without those, a test where both sides call the same code proves nothing.
 *(added 2026-10-22)* The same file checks that a disagreeing probe is dropped, that a non-finite
 activation is refused, that a chunked prefill matches across a split, and that
 a lookahead draft matches across a split. The chunked path is compared to
-itself, not to the full-window GEMM.
+itself, not to the full-window GEMM. *(added 2026-10-23)* It also checks that a
+flat parameter shard matches a resident forward on both the full-window path
+and a chunk, that the flat bytes are unchanged, and that a third live layer
+is refused. *(added 2026-10-23)* It also checks a sliding-window mask across a
+split, a JSON mask, a position seed, and a prepared prompt id list. A
+128-channel weight scale is checked to be a different number from the
+verified whole-column scale.
 
 Confirmed on a real model too: SmolLM-135M's 30 layers split `[10,10,10]`,
 `[1,14,15]`, `[0,15,15]` and `[5,5,5,5,5,5]` all produced token sequences
@@ -236,8 +304,8 @@ public/safetensors.js     header parsing, exact BF16/F16 widening, range coalesc
 public/hf.js              Hub client: range reads, gated repos, token redaction
 public/arch.js            config.json -> normalized spec; per-family tensor names
 public/tokenizer.js       byte-level BPE from the repo's own tokenizer.json
-public/shard.js           the plan, probe filter, lap estimate, prefix index, drafts   (added 2026-10-22)
-public/infer.js           forward pass, chunked prefill, lookahead readout          (added 2026-10-22)
+public/shard.js           the plan, probe filter, lap estimate, prefix index, drafts   (added 2026-10-22); flat parameter shard (added 2026-10-23)
+public/infer.js           forward pass, chunked prefill, lookahead readout          (added 2026-10-22); gather window of 2 (added 2026-10-23)
 public/wire.js            binary protocol + routing, as pure functions
 public/app.js             WebRTC mesh, assignments, queue, replay, token loop       (added 2026-10-22)
 public/verified_core.js   the verified INT8 units      (copied from live DaisyChain-Train, 2026-10-22)
@@ -262,6 +330,9 @@ docs/                     GETTING_STARTED, ARCHITECTURE
   4 bytes per parameter it holds.
 - **The head is a single point of failure.** *(added 2026-10-22.)* A stage that drops is removed and the
   prompt is replayed once. If that also fails, press Generate again.
+- **No optimizer shard, and no weight gather across peers.** *(added 2026-10-23.)* A stage with two or more layers keeps one flat copy and unpacks at most two layers. The slice is not smaller than one copy of its parameters. Weights still come from the Hub.
+- **No DeepInfer kernel stack.** *(added 2026-10-23.)* No expert parallel, no draft-model head, no compact KV drop, no disaggregated prefill. A sliding window is a softmax mask. JSON is a pick mask.
+- **No DeepGEMM kernel.** *(added 2026-10-23.)* FP8, FP4, 128-channel scales, and grouped MoE GEMMs are not used. One INT8 scale covers each activation row and each weight column.
 - **No authentication of activations.** A malicious stage that runs correct math
   but returns a crafted activation is not caught by any of this. Peers see each
   other's IPs, and the head sees your prompt. Ring with people you trust.

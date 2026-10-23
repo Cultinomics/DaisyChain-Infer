@@ -279,6 +279,155 @@ const GPT2 = Arch.fromConfig({
     assert.strictEqual(whole.length, prompt.length + 4);
   });
 
+  await t("a parameter shard matches a resident forward and keeps at most 2 layers live", async () => {
+    for (const spec of [LLAMA, GPT2]) {
+      const got = makeWeights(spec);
+      const st = { id: "p0", index: 0, lo: 0, hi: spec.layers, head: true };
+      const wRes = Shard.stageWeights(spec, st, got, Arch);
+      const wSh = Shard.stageWeights(spec, st, got, Arch);
+      const resident = Infer.makeStage(spec, st, wRes, ctx(), T, { resident: true });
+      const sharded = Infer.makeStage(spec, st, wSh, ctx(), T);
+      assert.ok(sharded.paramShard, "a multi-layer stage should flat-shard");
+      assert.strictEqual(sharded.paramShard.limit, 2);
+      assert.strictEqual(resident.paramShard, null);
+      assert.ok(wSh.emb && wSh.emb.length, "embeddings stay outside the shard");
+      assert.ok(wSh.lmHead && wSh.lmHead.length, "lm_head stays resident");
+      const firstKey = sharded.paramShard.slices[0][0].k;
+      assert.strictEqual(wSh.layers[0][firstKey], null, "weights are packed, not left on the layer");
+      const win = new Int32Array(T);
+      for (let i = 0; i < PROMPT.length; i++) win[T - PROMPT.length + i] = PROMPT[i];
+      const a = await Infer.runLayers(resident, Infer.embed(resident, win));
+      const flatBefore = sharded.paramShard.flat.slice();
+      const b = await Infer.runLayers(sharded, Infer.embed(sharded, win));
+      assert.ok(bitsEqual(a, b), "sharded runLayers diverged from resident");
+      assert.strictEqual(sharded.paramShard.live, 0);
+      assert.strictEqual(sharded.paramShard.maxLive, 2);
+      assert.strictEqual(wSh.layers[0][firstKey], null);
+      assert.strictEqual(wSh.layers[spec.layers - 1][firstKey], null);
+      assert.ok(bitsEqual(flatBefore, sharded.paramShard.flat), "the forward wrote the flat shard");
+      for (let i = 0; i < wRes.layers.length; i++) {
+        for (const p of sharded.paramShard.slices[i]) {
+          const src = wRes.layers[i][p.k];
+          assert.strictEqual(src.length, p.len);
+          for (let j = 0; j < p.len; j++)
+            if (sharded.paramShard.flat[p.off + j] !== src[j])
+              throw new Error("flat shard byte mismatch at layer " + i);
+        }
+      }
+      const ids = [1, 2, 3, 4];
+      const spanR = { pos0: 0, cache: [] };
+      const spanS = { pos0: 0, cache: [] };
+      const cr = await Infer.runLayersChunk(resident, Infer.embedRows(resident, ids, 0), spanR);
+      const cs = await Infer.runLayersChunk(sharded, Infer.embedRows(sharded, ids, 0), spanS);
+      assert.ok(bitsEqual(cr, cs), "sharded chunk diverged from resident");
+      assert.ok(bitsEqual(spanR.cache[0].k, spanS.cache[0].k));
+      assert.ok(bitsEqual(spanR.cache[0].v, spanS.cache[0].v));
+      assert.strictEqual(sharded.paramShard.live, 0);
+      assert.ok(bitsEqual(flatBefore, sharded.paramShard.flat));
+      Shard.gatherLayer(sharded.paramShard, wSh.layers, 0);
+      Shard.gatherLayer(sharded.paramShard, wSh.layers, 1);
+      assert.throws(() => Shard.gatherLayer(sharded.paramShard, wSh.layers, 2), /2 live/);
+      Shard.releaseLayer(sharded.paramShard, wSh.layers, 0);
+      Shard.releaseLayer(sharded.paramShard, wSh.layers, 1);
+      assert.strictEqual(sharded.paramShard.live, 0);
+    }
+    const st1 = { id: "p0", index: 0, lo: 0, hi: 1, head: true };
+    const one = Infer.makeStage(LLAMA, st1, Shard.stageWeights(LLAMA, st1, makeWeights(LLAMA), Arch), ctx(), T);
+    assert.strictEqual(one.paramShard, null, "a single layer stays resident");
+    assert.ok(one.w.layers[0].Wq && one.w.layers[0].Wq.length);
+    assert.strictEqual(Shard.makeParamShard([one.w.layers[0]]), null);
+  });
+
+  await t("sliding-window mask matches across a split and stays full-width", async () => {
+    const got = makeWeights(LLAMA);
+    const win = new Int32Array(T);
+    for (let i = 0; i < PROMPT.length; i++) win[T - PROMPT.length + i] = PROMPT[i];
+    const run = async (spec, splits) => {
+      const stages = stagesFor(spec, got, splits, T);
+      let x = Infer.embed(stages[0], win);
+      for (const S of stages) x = await Infer.runLayers(S, x);
+      return x;
+    };
+    const plain = await run(LLAMA, [LLAMA.layers]);
+    const wide = Object.assign({}, LLAMA, { slidingWindow: 1000, swaFrom: 0 });
+    assert.ok(bitsEqual(plain, await run(wide, [LLAMA.layers])), "a window wider than the cache changed the GEMM");
+    const late = Object.assign({}, LLAMA, { slidingWindow: 2, swaFrom: LLAMA.layers });
+    assert.ok(bitsEqual(plain, await run(late, [LLAMA.layers])), "layers before swaFrom must stay full causal");
+    const sw = Object.assign({}, LLAMA, { slidingWindow: 2, swaFrom: 0 });
+    const masked = await run(sw, [sw.layers]);
+    assert.ok(!bitsEqual(plain, masked), "a window of 2 did not change attention");
+    const split = await run(sw, [2, 2, 2]);
+    assert.ok(bitsEqual(masked, split), "sliding-window split diverged");
+    const cfg = Arch.fromConfig({
+      model_type: "qwen2", hidden_size: 64, num_hidden_layers: 4, num_attention_heads: 4,
+      num_key_value_heads: 2, intermediate_size: 128, vocab_size: 32,
+      use_sliding_window: true, sliding_window: 8, max_window_layers: 2,
+    });
+    assert.strictEqual(cfg.slidingWindow, 8);
+    assert.strictEqual(cfg.swaFrom, 2);
+    const off = Arch.fromConfig({
+      model_type: "qwen2", hidden_size: 64, num_hidden_layers: 4, num_attention_heads: 4,
+      num_key_value_heads: 2, intermediate_size: 128, vocab_size: 32,
+      use_sliding_window: false, sliding_window: 8,
+    });
+    assert.strictEqual(off.slidingWindow, 0);
+  });
+
+  await t("JSON mask, position seed, and a prepared prompt", async () => {
+    assert.strictEqual(Shard.jsonStatus("{\"a\":1}"), "ok");
+    assert.strictEqual(Shard.jsonAllows("", "{"), true);
+    assert.strictEqual(Shard.jsonAllows("{", "a"), false);
+    assert.strictEqual(Shard.jsonAllows("{", "\"a\":"), true);
+    assert.strictEqual(Shard.jsonAllows("{\"a\":1}", "x"), false);
+    assert.strictEqual(Shard.jsonAllows("tru", "e"), true);
+    assert.strictEqual(Shard.jsonAllows("tru", "k"), false);
+    assert.strictEqual(Shard.jsonAllows("[1,", "2]"), true);
+    assert.strictEqual(Shard.jsonAllows("{\"a\":1,", "}"), false);
+    assert.strictEqual(Shard.jsonAllows("", " "), true);
+    const logits = Float32Array.from([5, 0.1, 1]);
+    const decodePiece = (id) => ["x", "{", "}"][id];
+    assert.strictEqual(Infer.pickStructured(logits, {
+      schema: "json", temperature: 0, topK: 3, produced: "", decodePiece,
+    }), 1);
+    assert.strictEqual(Infer.pickStructured(logits, { temperature: 0 }), 0);
+    const sample = Float32Array.from([0, 0.2, 0.5, 1.2, 0.1]);
+    const a = Infer.pickToken(sample, { temperature: 0.8, topK: 5, seqSeed: 99, pos: 4, rng: () => 0.1 });
+    const b = Infer.pickToken(sample, { temperature: 0.8, topK: 5, seqSeed: 99, pos: 4, rng: () => 0.9 });
+    assert.strictEqual(a, b, "a position seed must ignore the mutable rng");
+    assert.strictEqual(Infer.seqDraw(99, 4), Infer.seqDraw(99, 4));
+    assert.deepStrictEqual(Shard.preparedIds("hi", { text: "hi", ids: [1, 2] }), [1, 2]);
+    assert.strictEqual(Shard.preparedIds("no", { text: "hi", ids: [1] }), null);
+    const gotIds = Shard.preparedIds("hi", { text: "hi", ids: [1, 2] });
+    gotIds.push(9);
+    assert.deepStrictEqual(Shard.preparedIds("hi", { text: "hi", ids: [1, 2] }), [1, 2]);
+  });
+
+  await t("a 128-channel weight scale is not the verified column scale", async () => {
+    // DeepGEMM's FP8 GEMM scales every 128 channels of K (BLOCK_K == 128).
+    // vgemmBlock uses one scale for the whole column. A spike in a later
+    // block must not tighten the earlier block under our recipe, and it
+    // must widen the single column scale. The forward path does not call
+    // the block recipe.
+    const V = require("./public/verified_core.js");
+    const k = 256, n = 3, block = 128;
+    const W = new Float32Array(k * n);
+    for (let i = 0; i < W.length; i++) W[i] = ((i * 17) % 50) / 25 - 1;
+    W[200 * n] = 40;
+    const col = V.quantizeCols(W, k, n);
+    assert.strictEqual(col.s.length, n);
+    const blockS = new Float32Array((k / block) * n);
+    for (let c = 0; c < n; c++) {
+      for (let b = 0; b < k / block; b++) {
+        let mx = 0;
+        for (let r = b * block; r < (b + 1) * block; r++) mx = Math.max(mx, Math.abs(W[r * n + c]));
+        blockS[b * n + c] = Math.max(mx / 127, 1e-8);
+      }
+    }
+    assert.ok(blockS[0] < col.s[0], "the early block must not inherit a later spike");
+    assert.strictEqual(col.s[0], Math.fround(40 / 127));
+    assert.strictEqual(V.MAX_INT32_K, 131071);
+  });
+
   await t("a non-finite activation is refused before any layer runs", async () => {
     const S = { w: { layers: [] }, spec: LLAMA, T: 2 };
     const bad = new Float32Array([0, 1, NaN, 2]);
